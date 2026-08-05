@@ -46,6 +46,7 @@
 		"release:minor": "node scripts/release.mjs minor",
 		"release:major": "node scripts/release.mjs major",
 		"release:fix-links": "node scripts/release-notes.mjs fix-github-releases",
+		"sync": "node scripts/sync-global-pi.mjs",
 		"prepare": "husky"
 	},
 	"devDependencies": {

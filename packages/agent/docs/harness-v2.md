@@ -688,7 +688,7 @@ The same rules run live: during normal execution the harness updates this state 
 
 Recovery appends are ordinary appends with one extra rule: skip any provisioned id that already exists. A crash during recovery therefore leaves less to recover; re-running recovery is always safe. Recovery repeats an unknown effect only when its policy permits it: a retryable step starts a new durable attempt, and a tool replays only when both replay declarations say `safe`. Interrupted hook handlers follow the section 11 replay table.
 
-Old v3 sessions contain no records. Every lane question answers "idle"; section 12 normalization restores `main` at the final retained logical entry (v3 `leaf` entries and discarded fact-like entries resolve through their nearest retained ancestor).
+Old v3 sessions contain no records. Every lane question answers "idle"; section 12 normalization restores `main` at the final retained logical entry after discarded fact-like entries resolve through their nearest retained ancestor.
 
 # Part III — API and implementation
 
@@ -1441,12 +1441,12 @@ A harness-written assistant `MessageEntry` always contains a `SettledAssistantMe
 
 Every v4 compaction — generated or hook-supplied — stores the complete `retainedTail`; an empty tail is `[]`, never omission. The compaction entry is a self-contained checkpoint: context builds never read past it. Entry `usage` fields — on assistant messages, tool results, compactions, and branch summaries — are immutable display snapshots of the response(s) that produced that entry: a message entry matches its one producing record; a compaction or branch-summary entry carries its successful attempt's request(s), never failed attempts. The durable ledger is the `usage` records; effective cost including later adjustments is a read-time ledger query by `entryId` (sections 5, 13).
 
-v3 files additionally contain `custom_message`, `label`, `session_info`, and `leaf` entries, plus old compaction entries that use `firstKeptEntryId`. Load normalizes them before exposing the v4 tree:
+v3 files additionally contain `custom_message`, `label`, and `session_info` entries, plus old compaction entries that use `firstKeptEntryId`. Load normalizes them before exposing the v4 tree:
 
 - `custom_message` becomes a custom agent message.
 - `label` and `session_info` become global facts (latest by file position wins) and disappear from the logical tree. A label targets its nearest retained parent.
-- `leaf` entries disappear; `main`'s leaf resolves through the last `leaf` entry, then to the nearest retained ancestor if that target was discarded.
 - Each retained child of a discarded entry is reparented to the discarded entry's nearest retained ancestor.
+- `main`'s leaf is the final physical entry resolved through discarded entries to its nearest retained ancestor.
 - An old compaction resolves `firstKeptEntryId` against its own branch and materializes that range as `retainedTail`. V4 never exposes or persists `firstKeptEntryId`.
 - v3 entry timestamps are ISO strings and convert to Unix milliseconds.
 
@@ -1553,13 +1553,23 @@ class Session implements SessionTree {          // bound to "main"
 interface IdGenerator { next(): string; }
 
 interface RecordQuery {
+  /** Exact lane match. Omit to query every lane. */
   lane?: string;
+  /** Exact record discriminant match. Omit to query every record type. */
   type?: LaneRecord["type"];
+  /**
+   * Operation identity. Matches OperationStartedRecord.id and the runId
+   * property of operation-owned records. Records without an operation
+   * identity do not match.
+   */
   runId?: string;
-  /** Valid only with type "operation_started". */
+  /** Exact operation intent kind. Valid only with type "operation_started". */
   operationKind?: OperationStartedRecord["intent"]["kind"];
+  /** Exclusive chronological lower bound: seq > afterSeq, regardless of order. */
   afterSeq?: number;
+  /** Sequence order. Default: "newestFirst". */
   order?: "oldestFirst" | "newestFirst";
+  /** Positive maximum number of matching records. */
   limit?: number;
 }
 ```
@@ -1650,7 +1660,7 @@ interface JsonlSessionListOptions { cwd?: string; }
 
 A v3 `parentSession` path resolves to the parent header's id when that file is available. If it is unavailable, metadata retains `legacyParentSessionPath`; first-write conversion preserves that optional header field rather than silently dropping the relationship. Format-4 code uses `parentSessionId` for repository relationships. `modifiedAt` is read from the filesystem and is not a sequenced session mutation.
 
-The repository layout matches coding-agent v3. Under `sessionsRoot`, each resolved cwd uses a directory named `--${resolvedCwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`. New files are named `${createdAtIso.replace(/[:.]/g, "-")}_${sessionId}.jsonl`. `list({ cwd })` scans that cwd's directory; `list()` scans every direct child directory. First-write v3 conversion replaces the original file in place and never changes its directory or filename.
+The repository layout matches coding-agent v3. Under `sessionsRoot`, each resolved cwd uses a directory named `--${resolvedCwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`. New files are named `${createdAtIso.replace(/[:.]/g, "-")}_${sessionId}.jsonl`. `list({ cwd })` scans that cwd's directory; `list()` scans every direct child directory. Listing reads only each file's header and filesystem metadata; it does not open or replay the session. A file with a missing or malformed header is omitted from the result. First-write v3 conversion replaces the original file in place and never changes its directory or filename.
 
 One file per session: a header line, then one JSON object per line, in `seq` order. Every logical mutation is exactly one line; a line is the atomic unit.
 
@@ -1669,7 +1679,7 @@ One file per session: a header line, then one JSON object per line, in `seq` ord
 - The optional `lane` on an entry line is envelope metadata and dies at decode. When present, the line atomically appends the entry and advances that lane; replay requires `parentId` to equal its current leaf. When absent, the line imports a fork entry without moving a lane. Entries expose `seq` but no lane.
 - Torn tail: a malformed final line is the append that died mid-write. Open truncates it; the write was never acknowledged, nothing is lost. A malformed line anywhere else is corruption; open rejects.
 - Durability is process-crash level: a resolved append call. No fsync promise; if power-loss durability is ever needed, it becomes an explicit capability.
-- v3 files: entries only, no `kind` tags. Open builds the normalized logical tree from section 12; every entry belongs to `main`, and `main`'s leaf resolves through the last `leaf` entry to its nearest retained ancestor. Before the first v4 append, the file is rewritten once with a v4 header (write temp, rename). This is the single conversion the compatibility policy allows. Read-only opens never rewrite.
+- v3 files: entries only, no `kind` tags. Open builds the normalized logical tree from section 12; every entry belongs to `main`, and `main`'s leaf is the final physical entry resolved through discarded entries to its nearest retained ancestor. Before the first v4 append, the file is rewritten once with a v4 header (write temp, rename). This is the single conversion the compatibility policy allows. Read-only opens never rewrite.
 
 ### SQLite
 
@@ -1753,6 +1763,13 @@ Case 4 — a branch still ends at an entry that has children.
 Stale branches (no lane resolves through them) are kept.
 
 Every restore query is an index seek plus a bounded scan: a lane's open operation via `(lane, type, seq)`, its last run-kind start via `(lane, type, op_kind, seq)`, its records above the operation via the same index, its own entries via the read plan from its leaf. No query touches another lane's traffic.
+
+SQLite implementation follow-ups:
+
+- Finish search backend work now in progress.
+- Add limit and cursor support to search results.
+- Route `findEntries` through indexed/search-backed query paths where possible instead of decoding and filtering all session entries.
+- Re-audit SQLite query plans after search and `findEntries` changes to see whether further index or query-shape improvements are warranted.
 
 ## 14. Agent-loop building blocks
 
@@ -2229,7 +2246,10 @@ async function driverLoop(): Promise<RunResult> {
     for (const w of [...op.pendingWrites])            await fx.applyPendingWrite(op.id, w.id);
     for (const m of steeringForThisCheckpoint(op))    await fx.consumeQueueItem(op.id, "steer", m.id);
     if (op.aborting) return await abortPath();
-    if (await contextOverLimit()) await autoCompact(pressureReason());   // may throw RunFailed
+    if (await contextOverLimit()) {
+      await autoCompact(pressureReason());                  // may throw RunFailed
+      continue;                                             // fresh checkpoint: input may have arrived during compaction
+    }
 
     if (needsAssistant()) {
       const outcome = await runTurn();
@@ -3142,7 +3162,7 @@ Gate invariants, asserted across Tier C:
 - Hooks: registration-id `resumeData` round trips, duplicate-id rejection, aggregation order, fail-closed `before_tool`.
 - Ledger completeness and the match invariant: every provider request leaves exactly one `usage` record per physical request (split-turn: two per attempt; a pending deferred fetch that reports no usage writes none); failed compaction series and discarded overflow responses lose no recorded cost; each usage-bearing entry's snapshot equals the newest non-adjustment record(s) bound to its id; a replayed tool records both executions; adjustments never alter entries and sum into read-time effective cost; `getStats()` token and cost fields equal the ledger sum and the `usage` event's totals after every commit; fork token and cost fields start at zero while `messageCount` includes all copied message entries; v3 conversion preserves totals through the aggregate import adjustment.
 - Overflow classification against the reported provider shapes: prompt 268,009 of a 272,000 window and 81,217 of 84,500 (recoverable), non-zero reasoning-only output, cache-write-heavy usage, a Codex-style provider that rejects `max_output_tokens`, a genuine 1,024-token cap fully used (not recoverable), and `length → length` stopping after exactly one recovery per conversational input.
-- v3 fixtures: labels, session info, and `leaf` entries mid-chain and at end of file, old `firstKeptEntryId` compactions — all open as one normalized idle `main` lane.
+- v3 fixtures: labels and session info mid-chain and at end of file, plus old `firstKeptEntryId` compactions — all open as one normalized idle `main` lane.
 
 ## 20. Implementation status and work packages
 
@@ -3203,9 +3223,9 @@ Implementation packages derive their tests from this design and do not use the p
 
 - [x] **QA2 — salvage storage and query tests.** Dependencies: QA1, R0.
   - Port worthwhile bounded-query, corruption, fork, immutable-read, lane, record-query, and recovery-query cases whose replacement APIs already exist. Skip deleted implementation details and behavior already covered by backend conformance.
-  - Acceptance: each reviewed storage/query case is covered by a cited current test, ported as a comprehensive invariant test, marked inapplicable, or left blocked on J1–J5.
+  - Acceptance: each reviewed storage/query case is covered by a cited current test, ported as a comprehensive invariant test, marked inapplicable, or left blocked on J1–J6.
 
-- [ ] **QA3 — salvage remaining legacy tests.** Dependencies: QA2, J5, O2.
+- [ ] **QA3 — salvage remaining legacy tests.** Dependencies: QA2, J6, O2.
   - After the new storage and harness runtime are complete, review every matrix case still blocked or uncovered. Port only still-valid invariants against the new public APIs; do not restore deleted APIs or old implementation details. QA3 may change focused tests and the matrix, but no production code.
   - Acceptance: every matrix row ends covered by a cited current test, ported by a comprehensive new test, or explicitly inapplicable; no row remains blocked or uncovered.
 
@@ -3237,9 +3257,9 @@ These packages merge R0 → R1 → R2 → R3. R1 and R2 add a reducer module ins
 
 ### Track J — JSONL storage
 
-**In progress and reserved: @davidbrai.** The work began before this plan was split into J0–J5. Before merge, the track owner must include or rebase onto R0's recovery-query contract and report which J packages are complete. Other agents must not pick a J package while this ownership marker remains.
+**In progress and reserved: @davidbrai.** The work began before this plan was split into J0–J6. Before merge, the track owner must include or rebase onto R0's recovery-query contract and report which J packages are complete. Other agents must not pick a J package while this ownership marker remains.
 
-These packages own `packages/agent/src/harness/session/jsonl/**`, the concrete `JsonlSessionRepo` export, and `packages/agent/test/harness/session/jsonl*.test.ts`. They merge J0 → J1 → J2 → J3 → J4 → J5 and may proceed in parallel with tracks L and I after R0.
+These packages own `packages/agent/src/harness/session/jsonl/**`, the concrete `JsonlSessionRepo` export, and `packages/agent/test/harness/session/jsonl*.test.ts`. They merge J0 → J1 → J2 → J3 → J4 → J5 → J6 and may proceed in parallel with tracks L and I after R0.
 
 - [x] **J0 — JSONL metadata and codec contracts.** Dependencies: R0.
   - Primary files: JSONL type/codec modules and focused codec tests; no public repository export yet.
@@ -3252,16 +3272,20 @@ These packages own `packages/agent/src/harness/session/jsonl/**`, the concrete `
 - [x] **J2 — format-4 repository lifecycle and forks.** Dependencies: J1.
   - Add create/open/list/delete, one writer queue per session, metadata ordering/filtering, branch/tree forks, and the concrete public `JsonlSessionRepo` export.
   - Acceptance: the complete backend-neutral conformance suite passes against JSONL, including concurrent lane writes and forks.
-- [ ] **J3 — format-4 crash and corruption behavior.** Dependencies: J2.
+- [x] **J3 — format-4 crash and corruption behavior.** Dependencies: J2.
   - Add torn-tail truncation, malformed-interior rejection, missing-reference rejection, and lifecycle/concurrency edge cases.
   - Acceptance: acknowledged writes survive reopen and malformed non-tail data is never silently repaired.
 - [ ] **J4 — read-only v3 normalization.** Dependencies: J3.
-  - Decode supported coding-agent v3 files into the normalized v4 logical tree: custom messages, labels, session info, leaf resolution, discarded-entry reparenting, old compactions, timestamps, parent mapping, and idle `main`.
+  - Decode supported coding-agent v3 files into the normalized v4 logical tree: custom messages, labels, session info, discarded-entry reparenting, old compactions, timestamps, parent mapping, and idle `main` at the final retained logical entry.
   - A read-only open must not modify the physical file. No coding-agent source or test is changed.
   - Acceptance: fixture tests cover every normalization rule in section 12 and malformed v3 input.
 - [ ] **J5 — first-write v3 conversion.** Dependencies: J4.
   - Rewrite through a temporary format-4 file on the first mutation, preserve metadata/facts/tree and resolved or legacy parent linkage, and add the aggregate v3 usage adjustment.
   - Acceptance: crash-safe conversion tests cover failure before rename, successful reopen, statistics preservation, unresolved legacy parent paths, and no second conversion.
+
+- [ ] **J6 — schema-based durable payload validation.** Dependencies: J5.
+  - Define shared TypeBox schemas for format-4 JSON and derive session types from them, including runtime schema registration for application-defined `AgentMessage` variants.
+  - Acceptance: malformed durable payloads are rejected consistently and JSONL decoding uses the shared schemas.
 
 ### Track I — primitives
 
@@ -3279,6 +3303,9 @@ I0, I1, and I2 may proceed independently. I3 → I4 → I5 is serial and begins 
   - Primary files: `packages/agent/src/harness/hooks.ts`, `packages/agent/test/harness/hooks.test.ts`.
   - Implement typed registration, stable-id validation, ordered aggregation, error isolation, fail-closed `before_tool`, and per-id resume data handling.
   - Acceptance: focused tests cover every section 11 aggregation and failure rule; no operation wiring yet.
+
+**Reserved: I2 by @vegarsti.**
+
 - [ ] **I2 — passive events and watch buffering.** Dependencies: none.
   - Primary files: `packages/agent/src/harness/events.ts`, `packages/agent/test/harness/events.test.ts`.
   - Implement passive listener isolation and the snapshot/start/unsubscribe buffer primitive used by lane and session watchers.
@@ -3365,7 +3392,7 @@ These packages also own `agent-harness.ts` and merge after H8, in order C1 → C
 
 ### Track O — observability and core completion
 
-These packages merge O1 → O2 → O3 → O4 after N1, with QA3 between O2 and O3. QA3 also requires J5. They may not modify `packages/coding-agent/**`.
+These packages merge O1 → O2 → O3 → O4 after N1, with QA3 between O2 and O3. QA3 also requires J6. They may not modify `packages/coding-agent/**`.
 
 - [ ] **O1 — snapshots and event completeness.** Dependencies: N1, I2.
   - Finish live lane/session snapshots, event filtering, streaming/running-tool state, and all section 10 event insertion points.
@@ -3376,15 +3403,15 @@ These packages merge O1 → O2 → O3 → O4 after N1, with QA3 between O2 and O
 - [ ] **O3 — action-prefix and race audit.** Dependencies: O2, QA3.
   - Complete Tier C for every race row, mechanically reopen every action prefix, compare automatic/manual logs, and verify reducer/live-state fixed points.
   - Acceptance: every race row has both orders and no documented crash action lacks a reopen test.
-- [ ] **O4 — backend parity and final core audit.** Dependencies: J5, O3.
+- [ ] **O4 — backend parity and final core audit.** Dependencies: J6, O3.
   - Run the complete storage/recovery matrix across memory, JSONL, and SQLite; remove dead agent/storage declarations and compatibility comments; verify exports/declarations and `./node`; update changelogs and core documentation.
   - Acceptance: all non-e2e tests and `npm run check` pass, no active harness operation remains scaffolded, `packages/coding-agent/**` is unchanged, and the worktree is clean.
 
 ### Dependency, priority, and merge summary
 
-The serial storage lane is **R0 → J0 → J1 → J2 → J3 → J4 → J5**. The reducer lane is **R0 → R1 → R2 → R3**. The loop lane is **I0 → L1 → L2 → L3**. The effects lane is **R2 → I3 → I4 → I5**, with I4 also requiring I0, I1, and L3. Before H0, the convergence gate is **F0 + R3 + I2 + I5**.
+The serial storage lane is **R0 → J0 → J1 → J2 → J3 → J4 → J5 → J6**. The reducer lane is **R0 → R1 → R2 → R3**. The loop lane is **I0 → L1 → L2 → L3**. The effects lane is **R2 → I3 → I4 → I5**, with I4 also requiring I0, I1, and L3. Before H0, the convergence gate is **F0 + R3 + I2 + I5**.
 
-The runtime merge lane is strictly **H0 → H1 → H2 → H3 → H4 → H5 → H6 → H7 → H8 → C1 → C2 → C3 → N1 → O1 → O2 → QA3 → O3 → O4**. J5 may land independently at any time before QA3. This ordering prevents concurrent rewrites of `agent-harness.ts`, assigns every public method, and ensures every live path lands only after its reducer, telemetry, interception, and effect boundaries exist.
+The runtime merge lane is strictly **H0 → H1 → H2 → H3 → H4 → H5 → H6 → H7 → H8 → C1 → C2 → C3 → N1 → O1 → O2 → QA3 → O3 → O4**. J6 may land independently at any time before QA3. This ordering prevents concurrent rewrites of `agent-harness.ts`, assigns every public method, and ensures every live path lands only after its reducer, telemetry, interception, and effect boundaries exist.
 
 ## 21. Required reading
 

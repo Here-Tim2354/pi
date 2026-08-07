@@ -2,7 +2,7 @@ import { uuidv7 } from "@earendil-works/pi-ai";
 import { assertJsonSerializable, Session } from "../session.ts";
 import { type ForkOptions, SessionError, type SessionRepo } from "../types.ts";
 import { metadataFromHeader, parseHeader } from "./codec.ts";
-import { fileResult, invalidFile } from "./errors.ts";
+import { fileResult } from "./errors.ts";
 import { JsonlSessionStorage } from "./storage.ts";
 import type {
 	JsonlSessionCreateOptions,
@@ -167,8 +167,10 @@ export class JsonlSessionRepo
 					await this.fs.readTextLines(file.path, { maxLines: 1 }),
 					`Failed to read session header ${file.path}`,
 				);
-				if (!firstLine) throw invalidFile(file.path, 1, "is missing a header");
-				metadata.push(metadataFromHeader(parseHeader(firstLine, file.path), file.path, file.mtimeMs));
+				if (!firstLine) continue;
+				const headerResult = parseHeader(firstLine);
+				if (!headerResult.ok) continue;
+				metadata.push(metadataFromHeader(headerResult.value, file.path, file.mtimeMs));
 			}
 		}
 		return metadata.sort((left, right) => right.modifiedAt - left.modifiedAt);

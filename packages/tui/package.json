@@ -1,6 +1,6 @@
 {
 	"name": "@earendil-works/pi-tui",
-	"version": "0.83.0",
+	"version": "0.84.0",
 	"description": "Terminal User Interface library with differential rendering for efficient text-based applications",
 	"type": "module",
 	"main": "dist/index.js",
@@ -15,6 +15,9 @@
 	"files": [
 		"dist/**/*",
 		"native/win32/prebuilds/**/*.node",
+		"native/win32/src/**/*.c",
+		"native/win32/build.mjs",
+		"native/win32/README.md",
 		"native/darwin/prebuilds/**/*.node",
 		"native/darwin/src/**/*.c",
 		"native/darwin/build.sh",

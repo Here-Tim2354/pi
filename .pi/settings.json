@@ -1,6 +1,7 @@
 {
   "packages": [
     "npm:pi-open-tui",
-    "npm:pi-web-access"
+    "npm:pi-web-access",
+    "npm:@ff-labs/pi-fff"
   ]
 }

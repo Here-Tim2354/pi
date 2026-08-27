@@ -38,9 +38,10 @@ Type `/` in the editor to open command completion. Extensions can register custo
 |---------|-------------|
 | `/login`, `/logout` | Manage OAuth or API-key credentials |
 | [`/llama`](llama-cpp.md) | Download, load, and unload llama.cpp router models |
-| `/model` | Switch models |
+| `/model` | Switch models; Ctrl+S in the picker saves the startup default |
+| `/thinking` | Switch thinking level; Ctrl+S in the picker saves the startup default |
 | `/scoped-models` | Enable/disable models for Ctrl+P cycling |
-| `/settings` | Thinking level, theme, message delivery, transport |
+| `/settings` | Theme, message delivery, transport, and other preferences |
 | `/resume` | Pick from previous sessions |
 | `/new` | Start a new session |
 | `/name <name>` | Set session display name |
@@ -213,7 +214,7 @@ cat README.md | pi -p "Summarize this text"
 | `--no-builtin-tools`, `-nbt` | Disable built-in tools but keep extension/custom tools enabled |
 | `--no-tools`, `-nt` | Disable all tools |
 
-Built-in tools: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`.
+Built-in tools: `read`, `bash`, `powershell` (Windows), `edit`, `write`, `grep`, `find`, `ls`.
 
 ### Resource Options
 

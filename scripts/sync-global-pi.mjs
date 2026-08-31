@@ -3,26 +3,34 @@
 // Build this repo's pi packages and install them over the global npm pi.
 // Cross-platform (macOS, Linux, Windows).
 //
-// User config (~/.pi/agent/) is machine-resident and not touched here; migrate
-// it across machines with the pi-config-pack / pi-config-apply skills (bundle
-// + user-decided merge). Extension code, prompts, and skills travel via git
-// (repo .pi/).
+// Project extensions (.pi/extensions/) are synced over the global extensions
+// (~/.pi/agent/extensions/) so they work in every project. Use
+// --skip-extensions to opt out. Other user config (~/.pi/agent/) is
+// machine-resident and not touched here; migrate it across machines with the
+// pi-config-pack / pi-config-apply skills (bundle + user-decided merge).
+// Prompts and skills travel via git (repo .pi/).
 //
 // Usage:
 //   npm run sync                            # check + build + smoke test, snapshot current global, ask, install
 //   npm run sync -- --skip-check            # skip npm run check (faster)
 //   npm run sync -- --yes                   # skip the confirmation prompt
+//   npm run sync -- --skip-extensions       # do not sync .pi/extensions to ~/.pi/agent/extensions
 //   npm run sync -- --rollback [backup-dir] # restore a previous global snapshot (latest if omitted)
 //   npm run sync -- --list-backups          # list available snapshots
 //
 // Snapshots are stored under ~/.pi/global-sync-backups/<timestamp>/ and contain
 // tarballs packed from the global install *before* it was overwritten, plus
 // restore.sh / restore.cmd for manual recovery.
+//
+// After installing, the npm "pi" shims are replaced with wrappers around a
+// generated pi-launcher.mjs: `pi --local` runs this repo's pi from source via
+// tsx, any other invocation runs the globally installed bundle. npm regenerates
+// the shims on every global install, so this step runs after each sync.
 
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 import { pathToFileURL } from "node:url";
 
@@ -40,11 +48,14 @@ const PACKAGES = [
 ];
 const KEEP_BACKUPS = 5;
 const NPM = process.platform === "win32" ? "npm.cmd" : "npm";
+const EXTENSIONS_RELATIVE_DIR = join(".pi", "extensions");
+const GLOBAL_EXTENSIONS_DIR = join(homedir(), ".pi", "agent", "extensions");
 
 function parseArgs(argv) {
 	const options = {
 		assumeYes: false,
 		runChecks: true,
+		syncExtensions: true,
 		rollback: false,
 		rollbackDir: undefined,
 		listBackups: false,
@@ -53,6 +64,7 @@ function parseArgs(argv) {
 		const arg = argv[i];
 		if (arg === "-y" || arg === "--yes") options.assumeYes = true;
 		else if (arg === "--skip-check") options.runChecks = false;
+		else if (arg === "--skip-extensions") options.syncExtensions = false;
 		else if (arg === "--list-backups") options.listBackups = true;
 		else if (arg === "--rollback") {
 			options.rollback = true;
@@ -117,12 +129,193 @@ function printBackups(backupRoot) {
 	}
 }
 
-function restoreBackup(dir) {
+function restoreBackup(dir, repoRoot) {
 	const tarballs = existsSync(dir) ? tgzFiles(dir) : [];
 	if (tarballs.length === 0) throw new Error(`Not a valid backup directory: ${dir}`);
 	console.log(`==> Restoring global pi from ${dir}`);
 	run(NPM, ["install", "-g", "--ignore-scripts", ...tarballs]);
+	if (repoRoot && existsSync(join(repoRoot, "packages", "coding-agent", "src", "cli.ts"))) {
+		installPiShims(repoRoot, run(NPM, ["root", "-g"], { capture: true }).trim());
+	}
 	console.log(`Global pi is now: ${tryCapture("pi", ["--version"]) ?? "unknown"}`);
+}
+
+/**
+ * Copy the repo's project extensions (.pi/extensions/) over the global
+ * extensions (~/.pi/agent/extensions/). Only same-named entries are
+ * overwritten; global-only extensions are kept. node_modules and .git are
+ * skipped. A copy of the previous global extensions is kept next to the npm
+ * package backup so the sync can be undone manually.
+ */
+function syncExtensions(repoRoot, backupDir) {
+	const srcDir = join(repoRoot, EXTENSIONS_RELATIVE_DIR);
+	const destDir = GLOBAL_EXTENSIONS_DIR;
+	if (!existsSync(srcDir)) {
+		console.log(`No ${EXTENSIONS_RELATIVE_DIR} in repo, skipping extension sync.`);
+		return;
+	}
+
+	const extBackupDir = join(backupDir, "extensions");
+	console.log(`==> Backing up global extensions to ${extBackupDir}`);
+	if (existsSync(destDir)) {
+		cpSync(destDir, extBackupDir, { recursive: true });
+	} else {
+		mkdirSync(extBackupDir, { recursive: true });
+	}
+
+	console.log(`\n==> Syncing extensions from ${srcDir} to ${destDir}`);
+	mkdirSync(destDir, { recursive: true });
+	const copied = copyExtensionTree(srcDir, destDir);
+	console.log(`Synced ${copied} file(s). Extensions take effect on next pi start or /reload.`);
+}
+
+/**
+ * Directory containing the npm-generated pi shims. `npm root -g` returns the
+ * global node_modules dir; the shims live one level up on Windows and in the
+ * prefix's bin/ on Unix.
+ */
+function globalBinDir(globalRoot) {
+	return process.platform === "win32" ? dirname(globalRoot) : join(dirname(dirname(globalRoot)), "bin");
+}
+
+function piLauncherScript(repoRoot) {
+	return `#!/usr/bin/env node
+// Generated by scripts/sync-global-pi.mjs — do not edit by hand.
+// \`pi --local\` launches the local pi repo from source (tsx); every other
+// invocation launches the globally installed pi bundle.
+import { spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const globalBin = dirname(fileURLToPath(import.meta.url));
+const globalCli = join(globalBin, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "bundle", "cli.js");
+const localRepo = ${JSON.stringify(repoRoot)};
+
+const args = process.argv.slice(2);
+const isLocal = args[0] === "--local";
+
+let entry;
+if (isLocal) {
+	const repoCli = join(localRepo, "packages", "coding-agent", "src", "cli.ts");
+	const repoTsx = join(localRepo, "node_modules", "tsx", "dist", "cli.mjs");
+	if (!existsSync(repoCli) || !existsSync(repoTsx)) {
+		console.error(\`pi --local: local repo pi not found under \${localRepo}\`);
+		process.exit(1);
+	}
+	entry = [repoTsx, repoCli];
+} else {
+	entry = [globalCli];
+}
+
+const result = spawnSync(process.execPath, [...entry, ...args.slice(isLocal ? 1 : 0)], { stdio: "inherit" });
+process.exit(result.status ?? 1);
+`;
+}
+
+function piShimCmd() {
+	return [
+		"@ECHO off",
+		"GOTO start",
+		":find_dp0",
+		"SET dp0=%~dp0",
+		"EXIT /b",
+		":start",
+		"SETLOCAL",
+		"CALL :find_dp0",
+		"",
+		'IF EXIST "%dp0%\\node.exe" (',
+		'  SET "_prog=%dp0%\\node.exe"',
+		") ELSE (",
+		'  SET "_prog=node"',
+		"  SET PATHEXT=%PATHEXT:;.JS;=;%",
+		")",
+		"",
+		'endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\\pi-launcher.mjs" %*',
+		"",
+	].join("\r\n");
+}
+
+function piShimPs1() {
+	return `#!/usr/bin/env pwsh
+$basedir=Split-Path $MyInvocation.MyCommand.Definition -Parent
+
+$exe=""
+if ($PSVersionTable.PSVersion -lt "6.0" -or $IsWindows) {
+  # Fix case when both the Windows and Linux builds of Node
+  # are installed in the same directory
+  $exe=".exe"
+}
+$ret=0
+if (Test-Path "$basedir/node$exe") {
+  if ($MyInvocation.ExpectingInput) {
+    $input | & "$basedir/node$exe"  "$basedir/pi-launcher.mjs" $args
+  } else {
+    & "$basedir/node$exe"  "$basedir/pi-launcher.mjs" $args
+  }
+  $ret=$LASTEXITCODE
+} else {
+  if ($MyInvocation.ExpectingInput) {
+    $input | & "node$exe"  "$basedir/pi-launcher.mjs" $args
+  } else {
+    & "node$exe"  "$basedir/pi-launcher.mjs" $args
+  }
+  $ret=$LASTEXITCODE
+}
+exit $ret
+`;
+}
+
+function piShimSh() {
+	return `#!/bin/sh
+basedir=$(dirname "$(echo "$0" | sed -e 's,\\\\,/,g')")
+
+case \`uname\` in
+    *CYGWIN*|*MINGW*|*MSYS*)
+        if command -v cygpath > /dev/null 2>&1; then
+            basedir=\`cygpath -w "$basedir"\`
+        fi
+    ;;
+esac
+
+if [ -x "$basedir/node" ]; then
+  exec "$basedir/node"  "$basedir/pi-launcher.mjs" "$@"
+else
+  exec node  "$basedir/pi-launcher.mjs" "$@"
+fi
+`;
+}
+
+/**
+ * Replace npm's pi shims with wrappers around pi-launcher.mjs so that
+ * `pi --local` runs the repo pi from source while every other invocation uses
+ * the globally installed bundle. npm regenerates its shims on every global
+ * install, so this must run after each `npm install -g`.
+ */
+function installPiShims(repoRoot, globalRoot) {
+	const bin = globalBinDir(globalRoot);
+	writeFileSync(join(bin, "pi-launcher.mjs"), piLauncherScript(repoRoot));
+	writeFileSync(join(bin, "pi.cmd"), piShimCmd());
+	writeFileSync(join(bin, "pi.ps1"), piShimPs1());
+	writeFileSync(join(bin, "pi"), piShimSh());
+	console.log(`Installed pi shims in ${bin} (pi --local runs the repo pi from ${repoRoot})`);
+}
+
+function copyExtensionTree(srcDir, destDir) {
+	let count = 0;
+	for (const entry of readdirSync(srcDir, { withFileTypes: true })) {
+		if (entry.name === "node_modules" || entry.name === ".git") continue;
+		const src = join(srcDir, entry.name);
+		const dest = join(destDir, entry.name);
+		if (entry.isDirectory()) {
+			mkdirSync(dest, { recursive: true });
+			count += copyExtensionTree(src, dest);
+		} else {
+			copyFileSync(src, dest);
+			count++;
+		}
+	}
+	return count;
 }
 
 async function confirm(question) {
@@ -150,7 +343,7 @@ async function main() {
 			if (backups.length === 0) throw new Error(`No backups found in ${backupRoot}`);
 			dir = backups[backups.length - 1];
 		}
-		restoreBackup(dir);
+		restoreBackup(dir, repoRoot);
 		return;
 	}
 
@@ -212,6 +405,11 @@ async function main() {
 
 	console.log("\n==> Installing tarballs globally");
 	run(NPM, ["install", "-g", "--ignore-scripts", ...tgzFiles(join(outDir, "tarballs"))]);
+	installPiShims(repoRoot, globalRoot);
+
+	if (options.syncExtensions) {
+		syncExtensions(repoRoot, backupDir);
+	}
 
 	console.log(`\nGlobal pi is now: ${tryCapture("pi", ["--version"]) ?? "unknown"}`);
 	console.log("To roll back: npm run sync -- --rollback");

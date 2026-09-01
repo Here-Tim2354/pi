@@ -30,6 +30,8 @@
 			"packages/session-backends/*/src/**/*.ts",
 			"packages/session-backends/*/test/**/*.ts",
 			"packages/coding-agent/examples/**/*.ts",
+			".pi/extensions-src/**/*.ts",
+			"!.pi/extensions-src/prompt-url-widget.ts",
 			"!**/node_modules/**/*",
 			"!**/test-sessions.ts",
 			"!**/models.generated.ts",

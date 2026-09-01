@@ -1,4 +1,6 @@
 {
+  "defaultProvider": "opencode-go",
+  "defaultModel": "glm-5.3-flash",
   "packages": [
     "npm:pi-open-tui",
     "npm:pi-web-access",

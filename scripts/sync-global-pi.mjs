@@ -3,18 +3,20 @@
 // Build this repo's pi packages and install them over the global npm pi.
 // Cross-platform (macOS, Linux, Windows).
 //
-// Project extensions (.pi/extensions/) are synced over the global extensions
-// (~/.pi/agent/extensions/) so they work in every project. Use
-// --skip-extensions to opt out. Other user config (~/.pi/agent/) is
-// machine-resident and not touched here; migrate it across machines with the
-// pi-config-pack / pi-config-apply skills (bundle + user-decided merge).
-// Prompts and skills travel via git (repo .pi/).
+// Project extensions (.pi/extensions-src/) are synced over the global
+// extensions (~/.pi/agent/extensions/) so they work in every project. The
+// source dir name is deliberately NOT .pi/extensions: pi auto-discovers
+// .pi/extensions/ inside this repo, which would double-register tools also
+// loaded from the global dir. Use --skip-extensions to opt out. Other user
+// config (~/.pi/agent/) is machine-resident and not touched here; migrate it
+// across machines with the pi-config-pack / pi-config-apply skills (bundle +
+// user-decided merge). Prompts and skills travel via git (repo .pi/).
 //
 // Usage:
 //   npm run sync                            # check + build + smoke test, snapshot current global, ask, install
 //   npm run sync -- --skip-check            # skip npm run check (faster)
 //   npm run sync -- --yes                   # skip the confirmation prompt
-//   npm run sync -- --skip-extensions       # do not sync .pi/extensions to ~/.pi/agent/extensions
+//   npm run sync -- --skip-extensions       # do not sync .pi/extensions-src to ~/.pi/agent/extensions
 //   npm run sync -- --rollback [backup-dir] # restore a previous global snapshot (latest if omitted)
 //   npm run sync -- --list-backups          # list available snapshots
 //
@@ -48,7 +50,7 @@ const PACKAGES = [
 ];
 const KEEP_BACKUPS = 5;
 const NPM = process.platform === "win32" ? "npm.cmd" : "npm";
-const EXTENSIONS_RELATIVE_DIR = join(".pi", "extensions");
+const EXTENSIONS_RELATIVE_DIR = join(".pi", "extensions-src");
 const GLOBAL_EXTENSIONS_DIR = join(homedir(), ".pi", "agent", "extensions");
 
 function parseArgs(argv) {

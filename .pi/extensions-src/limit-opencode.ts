@@ -11,9 +11,9 @@
  *   2. pi's own credential store via `ctx.modelRegistry` (source: pi)
  *   3. OpenCode's local `auth.json` (`opencode-go` entry) (source: auth-file)
  *
- * Output goes into the transcript as a custom message rendered by
- * `registerMessageRenderer`, so the block (not just a toast) is printed in the
- * TUI, mirroring built-in commands like `/session`.
+ * Output is persisted as a custom entry (`pi.appendEntry`) rendered by
+ * `registerEntryRenderer`, so the block (not just a toast) is printed in the
+ * TUI transcript — while custom entries never participate in the LLM context.
  */
 
 import { readFileSync } from "node:fs";
@@ -258,20 +258,26 @@ function buildErrorLines(details: OcgoDetails, theme: Theme): string[] {
 	return [theme.bold(theme.fg("error", `OpenCode Go usage: <err:${code}>`)), theme.fg("dim", message)];
 }
 
-function summarizeUsage(windows: Partial<Record<WindowKind, UsageWindow>>): string {
-	const parts: string[] = [];
-	for (const kind of ["rolling", "weekly", "monthly"] as const) {
-		const window = windows[kind];
-		if (window) parts.push(`${kind} ${window.percent}%`);
-	}
-	return `OpenCode Go usage: ${parts.join(", ") || "no windows"}`;
-}
-
 // -------------------------------------------------------------------------
 // Extension
 // -------------------------------------------------------------------------
 
 export default function limitOpencodeExtension(pi: ExtensionAPI): void {
+	// Custom ENTRY (pi.appendEntry): rendered in the transcript, but never sent to the LLM.
+	pi.registerEntryRenderer<OcgoDetails>(CUSTOM_TYPE, (entry, _options, theme) => {
+		const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
+		const details = entry.data;
+		const lines = details
+			? details.result === "ok"
+				? buildSuccessLines(details, theme)
+				: buildErrorLines(details, theme)
+			: [];
+		box.addChild(new Text(lines.length > 0 ? lines.join("\n") : "OpenCode Go usage", 0, 0));
+		return box;
+	});
+
+	// Legacy renderer: sessions recorded before the appendEntry switch still contain
+	// custom *messages* with `details`; keep them rendering nicely on reload.
 	pi.registerMessageRenderer<OcgoDetails>(CUSTOM_TYPE, (message, { outputPad }, theme) => {
 		const box = new Box(outputPad, 1, (text) => theme.bg("customMessageBg", text));
 		const details = message.details;
@@ -306,18 +312,13 @@ export default function limitOpencodeExtension(pi: ExtensionAPI): void {
 			}
 
 			if (!resolved) {
-				pi.sendMessage({
-					customType: CUSTOM_TYPE,
-					content: summarizeUsage({}),
-					display: true,
-					details: {
-						result: "error",
-						windows: {},
-						meta,
-						error: {
-							code: "no-key",
-							message: "No OpenCode Go API key found. Set OPENCODE_API_KEY or run /login opencode-go.",
-						},
+				pi.appendEntry(CUSTOM_TYPE, {
+					result: "error",
+					windows: {},
+					meta,
+					error: {
+						code: "no-key",
+						message: "No OpenCode Go API key found. Set OPENCODE_API_KEY or run /login opencode-go.",
 					},
 				});
 				return;
@@ -329,75 +330,49 @@ export default function limitOpencodeExtension(pi: ExtensionAPI): void {
 
 				switch (outcome.kind) {
 					case "ok":
-						pi.sendMessage({
-							customType: CUSTOM_TYPE,
-							content: summarizeUsage(outcome.windows),
-							display: true,
-							details: { result: "ok", windows: outcome.windows, meta },
-						});
+						pi.appendEntry(CUSTOM_TYPE, { result: "ok", windows: outcome.windows, meta });
 						return;
 					case "unauthorized":
-						pi.sendMessage({
-							customType: CUSTOM_TYPE,
-							content: "OpenCode Go usage: unauthorized",
-							display: true,
-							details: {
-								result: "error",
-								windows: {},
-								meta,
-								error: {
-									code: "unauthorized",
-									message:
-										"OpenCode rejected the API key (HTTP 401). Re-authenticate or reset OPENCODE_API_KEY.",
-								},
+						pi.appendEntry(CUSTOM_TYPE, {
+							result: "error",
+							windows: {},
+							meta,
+							error: {
+								code: "unauthorized",
+								message: "OpenCode rejected the API key (HTTP 401). Re-authenticate or reset OPENCODE_API_KEY.",
 							},
 						});
 						return;
 					case "no-subscription":
-						pi.sendMessage({
-							customType: CUSTOM_TYPE,
-							content: "OpenCode Go usage: no subscription",
-							display: true,
-							details: {
-								result: "error",
-								windows: {},
-								meta,
-								error: {
-									code: "no-subscription",
-									message: "This OpenCode Go key is valid but has no Go subscription.",
-								},
+						pi.appendEntry(CUSTOM_TYPE, {
+							result: "error",
+							windows: {},
+							meta,
+							error: {
+								code: "no-subscription",
+								message: "This OpenCode Go key is valid but has no Go subscription.",
 							},
 						});
 						return;
 					case "http":
-						pi.sendMessage({
-							customType: CUSTOM_TYPE,
-							content: `OpenCode Go usage: HTTP ${outcome.status}`,
-							display: true,
-							details: {
-								result: "error",
-								windows: {},
-								meta,
-								error: {
-									code: `http-${outcome.status}`,
-									message: `The OpenCode Go usage endpoint returned HTTP ${outcome.status}.`,
-								},
+						pi.appendEntry(CUSTOM_TYPE, {
+							result: "error",
+							windows: {},
+							meta,
+							error: {
+								code: `http-${outcome.status}`,
+								message: `The OpenCode Go usage endpoint returned HTTP ${outcome.status}.`,
 							},
 						});
 						return;
 					case "bad-json":
-						pi.sendMessage({
-							customType: CUSTOM_TYPE,
-							content: "OpenCode Go usage: unexpected response",
-							display: true,
-							details: {
-								result: "error",
-								windows: {},
-								meta,
-								error: {
-									code: "bad-json",
-									message: "The usage endpoint returned an unexpected response shape.",
-								},
+						pi.appendEntry(CUSTOM_TYPE, {
+							result: "error",
+							windows: {},
+							meta,
+							error: {
+								code: "bad-json",
+								message: "The usage endpoint returned an unexpected response shape.",
 							},
 						});
 						return;
@@ -405,21 +380,16 @@ export default function limitOpencodeExtension(pi: ExtensionAPI): void {
 			} catch (error) {
 				const name = error instanceof Error && error.name ? error.name : "";
 				const code = name === "TimeoutError" || name === "AbortError" ? "timeout" : "network";
-				pi.sendMessage({
-					customType: CUSTOM_TYPE,
-					content: `OpenCode Go usage: ${code}`,
-					display: true,
-					details: {
-						result: "error",
-						windows: {},
-						meta,
-						error: {
-							code,
-							message:
-								code === "timeout"
-									? "The request to the OpenCode Go usage endpoint timed out."
-									: "Failed to reach the OpenCode Go usage endpoint.",
-						},
+				pi.appendEntry(CUSTOM_TYPE, {
+					result: "error",
+					windows: {},
+					meta,
+					error: {
+						code,
+						message:
+							code === "timeout"
+								? "The request to the OpenCode Go usage endpoint timed out."
+								: "Failed to reach the OpenCode Go usage endpoint.",
 					},
 				});
 			}

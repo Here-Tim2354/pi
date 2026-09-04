@@ -45,3 +45,4 @@ collect.sh
 
 # Local temp files (not tracked)
 .tmp/
+packages/agent/docs/extensions/pi-server-artifact/index.md

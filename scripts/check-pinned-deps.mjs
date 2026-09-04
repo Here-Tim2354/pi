@@ -6,6 +6,7 @@ const exactVersionPattern = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-
 // ".pi" holds pi's local agent state (e.g. .pi/npm from project-local package
 // installs); its manifests are machine-generated and exempt from pinning.
 const ignoredDirectories = new Set([".git", ".pi", "dist", "node_modules"]);
+const internalPackageNames = new Set(["@earendil-works/chord"]);
 const packageJsonFiles = [];
 
 function collectPackageJsonFiles(directory) {
@@ -24,7 +25,7 @@ function collectPackageJsonFiles(directory) {
 }
 
 function isInternalWorkspaceDependency(name) {
-	return name.startsWith("@earendil-works/pi-");
+	return name.startsWith("@earendil-works/pi-") || internalPackageNames.has(name);
 }
 
 function isNonRegistrySpecifier(specifier) {

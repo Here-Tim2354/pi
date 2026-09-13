@@ -25,7 +25,7 @@ import type {
 	PrepareNextTurnContext,
 	ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
-import { contentText } from "@earendil-works/pi-ai";
+import { contentText, retryDelayMs } from "@earendil-works/pi-ai";
 import type {
 	AssistantMessage,
 	AuthResult,
@@ -300,10 +300,6 @@ function estimateMessagesTokens(messages: AgentMessage[]): number {
 }
 
 // ============================================================================
-// Constants
-// ============================================================================
-
-// ============================================================================
 // AgentSession Class
 // ============================================================================
 
@@ -541,7 +537,7 @@ export class AgentSession {
 
 	private async _compactBeforeNextAssistantResponse(context: AgentContext): Promise<AgentContext> {
 		const model = this.model;
-		const settings = this.settingsManager.getCompactionSettings();
+		const settings = this.settingsManager.getCompactionSettings(model);
 
 		if (
 			!model ||
@@ -1147,6 +1143,26 @@ export class AgentSession {
 		return this.agent.hasQueuedMessages();
 	}
 
+	private async _runInputHandlers(
+		text: string,
+		images: ImageContent[] | undefined,
+		source: InputSource,
+		streamingBehavior?: "steer" | "followUp",
+	): Promise<{ text: string; images: ImageContent[] | undefined } | undefined> {
+		if (!this._extensionRunner.hasHandlers("input")) {
+			return { text, images };
+		}
+
+		const inputResult = await this._extensionRunner.emitInput(text, images, source, streamingBehavior);
+		if (inputResult.action === "handled") {
+			return undefined;
+		}
+		if (inputResult.action === "transform") {
+			return { text: inputResult.text, images: inputResult.images ?? images };
+		}
+		return { text, images };
+	}
+
 	/**
 	 * Send a prompt to the agent.
 	 * - Handles extension commands (registered via pi.registerCommand) immediately, even during streaming
@@ -1180,24 +1196,17 @@ export class AgentSession {
 			}
 
 			// Emit input event for extension interception (before skill/template expansion)
-			let currentText = text;
-			let currentImages = options?.images;
-			if (this._extensionRunner.hasHandlers("input")) {
-				const inputResult = await this._extensionRunner.emitInput(
-					currentText,
-					currentImages,
-					options?.source ?? "interactive",
-					this.isStreaming ? options?.streamingBehavior : undefined,
-				);
-				if (inputResult.action === "handled") {
-					preflightResult?.(true);
-					return;
-				}
-				if (inputResult.action === "transform") {
-					currentText = inputResult.text;
-					currentImages = inputResult.images ?? currentImages;
-				}
+			const processedInput = await this._runInputHandlers(
+				text,
+				options?.images,
+				options?.source ?? "interactive",
+				this.isStreaming ? options?.streamingBehavior : undefined,
+			);
+			if (!processedInput) {
+				preflightResult?.(true);
+				return;
 			}
+			const { text: currentText, images: currentImages } = processedInput;
 
 			// Expand skill commands (/skill:name args) and prompt templates (/template args)
 			let expandedText = currentText;
@@ -1376,25 +1385,45 @@ export class AgentSession {
 		}
 	}
 
+	private async _queueUserInput(
+		text: string,
+		images: ImageContent[] | undefined,
+		behavior: "steer" | "followUp",
+		source: InputSource,
+	): Promise<void> {
+		if (text.startsWith("/")) {
+			this._throwIfExtensionCommand(text);
+		}
+
+		const processedInput = await this._runInputHandlers(
+			text,
+			images,
+			source,
+			this.isStreaming ? behavior : undefined,
+		);
+		if (!processedInput) return;
+
+		let expandedText = this._expandSkillCommand(processedInput.text);
+		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
+
+		if (behavior === "steer") {
+			await this._queueSteer(expandedText, processedInput.images);
+		} else {
+			await this._queueFollowUp(expandedText, processedInput.images);
+		}
+	}
+
 	/**
 	 * Queue a steering message while the agent is running.
 	 * Delivered after the current assistant turn finishes executing its tool calls,
 	 * before the next LLM call.
 	 * Expands skill commands and prompt templates. Errors on extension commands.
 	 * @param images Optional image attachments to include with the message
+	 * @param options Input source; defaults to interactive
 	 * @throws Error if text is an extension command
 	 */
-	async steer(text: string, images?: ImageContent[]): Promise<void> {
-		// Check for extension commands (cannot be queued)
-		if (text.startsWith("/")) {
-			this._throwIfExtensionCommand(text);
-		}
-
-		// Expand skill commands and prompt templates
-		let expandedText = this._expandSkillCommand(text);
-		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
-
-		await this._queueSteer(expandedText, images);
+	async steer(text: string, images?: ImageContent[], options?: { source?: InputSource }): Promise<void> {
+		await this._queueUserInput(text, images, "steer", options?.source ?? "interactive");
 	}
 
 	/**
@@ -1402,19 +1431,11 @@ export class AgentSession {
 	 * Delivered only when agent has no more tool calls or steering messages.
 	 * Expands skill commands and prompt templates. Errors on extension commands.
 	 * @param images Optional image attachments to include with the message
+	 * @param options Input source; defaults to interactive
 	 * @throws Error if text is an extension command
 	 */
-	async followUp(text: string, images?: ImageContent[]): Promise<void> {
-		// Check for extension commands (cannot be queued)
-		if (text.startsWith("/")) {
-			this._throwIfExtensionCommand(text);
-		}
-
-		// Expand skill commands and prompt templates
-		let expandedText = this._expandSkillCommand(text);
-		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
-
-		await this._queueFollowUp(expandedText, images);
+	async followUp(text: string, images?: ImageContent[], options?: { source?: InputSource }): Promise<void> {
+		await this._queueUserInput(text, images, "followUp", options?.source ?? "interactive");
 	}
 
 	/**
@@ -1950,14 +1971,15 @@ export class AgentSession {
 		let fromExtension = false;
 
 		try {
-			if (!this.model) {
+			const model = this.model;
+			if (!model) {
 				throw new Error(formatNoModelSelectedMessage());
 			}
 
-			const { model: requestModel, apiKey, headers, env } = await this._getSummarizationRequestAuth(this.model);
+			const settings = this.settingsManager.getCompactionSettings(model);
+			const { model: requestModel, apiKey, headers, env } = await this._getSummarizationRequestAuth(model);
 
 			const pathEntries = this.sessionManager.getBranch();
-			const settings = this.settingsManager.getCompactionSettings();
 
 			const preparation = prepareCompaction(pathEntries, settings);
 			if (!preparation) {
@@ -2130,7 +2152,7 @@ export class AgentSession {
 	 * @returns Whether the post-run loop should call `agent.continue()` for overflow recovery or queued messages
 	 */
 	private async _checkCompaction(assistantMessage: AssistantMessage, skipAbortedCheck = true): Promise<boolean> {
-		const settings = this.settingsManager.getCompactionSettings();
+		const settings = this.settingsManager.getCompactionSettings(this.model);
 		if (!settings.enabled) return false;
 
 		// Skip if message was aborted (user cancelled) - unless skipAbortedCheck is false
@@ -2246,16 +2268,17 @@ export class AgentSession {
 	 * @returns Whether the post-run loop should call `agent.continue()`
 	 */
 	private async _runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<boolean> {
-		const settings = this.settingsManager.getCompactionSettings();
+		const model = this.model;
+		const settings = this.settingsManager.getCompactionSettings(model);
 		let started = false;
 		let fromExtension = false;
 
 		try {
-			if (!this.model) {
+			if (!model) {
 				return false;
 			}
 
-			const { model: requestModel, apiKey, headers, env } = await this._getSummarizationRequestAuth(this.model);
+			const { model: requestModel, apiKey, headers, env } = await this._getSummarizationRequestAuth(model);
 
 			const pathEntries = this.sessionManager.getBranch();
 
@@ -2905,7 +2928,7 @@ export class AgentSession {
 			return false;
 		}
 
-		const delayMs = settings.baseDelayMs * 2 ** (this._retryAttempt - 1);
+		const delayMs = retryDelayMs(settings, this._retryAttempt);
 
 		this._emit({
 			type: "auto_retry_start",

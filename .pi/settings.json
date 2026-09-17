@@ -1,7 +1,2 @@
 {
-  "defaultProvider": "opencode-go",
-  "defaultModel": "glm-5.3-flash",
-  "packages": [
-    "npm:@ff-labs/pi-fff"
-  ]
 }

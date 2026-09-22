@@ -20,6 +20,7 @@ import type {
 	KnownProvider,
 	Model,
 	ModelCost,
+	ModelPromptCache,
 	OpenAICompletionsCompat,
 	OpenAIResponsesCompat,
 } from "../src/types.ts";
@@ -32,6 +33,11 @@ import {
 	validateGeneratedModelData,
 	validateModelDataDirectory,
 } from "./model-data.ts";
+import {
+	DEFAULT_RADIUS_GATEWAY,
+	getRadiusModelsFromConfig,
+	loadRadiusGatewayConfig,
+} from "../src/providers/radius-config.ts";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -394,6 +400,16 @@ const OPENAI_LONG_CONTEXT_PRICING_MODEL_IDS = new Set([
 	"gpt-6-astra",
 ]);
 
+// Keep the generated default no less restrictive than coding-agent's historical
+// image preprocessing. Provider limits can narrow this profile, but unknown
+// providers retain the cache-safe 2000px / 4.5 MiB behavior.
+const DEFAULT_IMAGE_RESIZE = {
+	maxWidth: 2000,
+	maxHeight: 2000,
+	maxBytes: 4.5 * 1024 * 1024,
+	jpegQuality: 80,
+} as const;
+
 function withOpenAiLongContextPricing(cost: Model<Api>["cost"]): Model<Api>["cost"] {
 	return {
 		...cost,
@@ -624,7 +640,7 @@ const OPENAI_COMPLETIONS_DEFAULT_COMPAT = {
 	chatTemplateKwargs: {},
 	chatTemplateArgs: {},
 	zaiToolStream: false,
-	supportsStrictMode: true,
+	supportsStrictMode: false,
 	supportsOpenAIGrammarTools: false,
 	supportsMidConvoSystemMessages: false,
 	supportsMidConvoToolAdditions: false,
@@ -664,13 +680,13 @@ function detectOpenAICompletionsCompat(model: Model<"openai-completions">): Open
 	const isCloudflareAiGateway = provider === "cloudflare-ai-gateway" || baseUrl.includes("gateway.ai.cloudflare.com");
 	const isNvidia = provider === "nvidia" || baseUrl.includes("integrate.api.nvidia.com");
 	const isAntLing = provider === "ant-ling" || baseUrl.includes("api.ant-ling.com");
+	const isCerebras = provider === "cerebras" || baseUrl.includes("cerebras.ai");
 	const isTogetherReasoningOnly = isTogether && TOGETHER_REASONING_ONLY_MODELS.has(model.id);
 	const isDeepSeek = provider === "deepseek" || baseUrl.toLowerCase().includes("deepseek.com");
 
 	const isNonStandard =
 		isNvidia ||
-		provider === "cerebras" ||
-		baseUrl.includes("cerebras.ai") ||
+		isCerebras ||
 		provider === "xai" ||
 		baseUrl.includes("api.x.ai") ||
 		isTogether ||
@@ -728,7 +744,8 @@ function detectOpenAICompletionsCompat(model: Model<"openai-completions">): Open
 		chatTemplateKwargs: {},
 		chatTemplateArgs: {},
 		zaiToolStream: false,
-		supportsStrictMode: !isMoonshot && !isTogether && !isCloudflareAiGateway && !isNvidia,
+		// Preserve built-in behavior as explicit metadata against the conservative runtime default.
+		supportsStrictMode: !isMoonshot && !isTogether && !isCloudflareAiGateway && !isNvidia && !isCerebras,
 		supportsOpenAIGrammarTools: false,
 		supportsMidConvoSystemMessages: false,
 		supportsMidConvoToolAdditions: false,
@@ -926,6 +943,49 @@ function applyOpenAIExplicitPromptCacheMetadata(model: Model<Api>): void {
 	};
 }
 
+// Anthropic ephemeral entries have a hard five-minute lifetime; `ttl: "1h"`
+// extends it to one hour. Only direct Anthropic is annotated so cache warming
+// does not assume equivalent behavior through proxies.
+// https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching
+const ANTHROPIC_PROMPT_CACHE: ModelPromptCache = { short: 300, long: 3600 };
+
+function applyPromptCacheMetadata(model: Model<Api>): void {
+	if (model.provider === "anthropic" && model.api === "anthropic-messages") {
+		model.promptCache = ANTHROPIC_PROMPT_CACHE;
+	}
+	// Do not add OpenAI lifetimes yet. Before enabling warming for explicit
+	// OpenAI caches, re-evaluate it using observed expiry, replay, and billing
+	// behavior; a documented TTL alone does not establish full cache loss.
+}
+
+function applyImageInputMetadata(model: Model<Api>): void {
+	if (!model.input.includes("image")) return;
+
+	const providerLimits: Model<Api>["inputLimits"] =
+		model.provider === "anthropic"
+			? {
+					maxRequestBytes: 32 * 1024 * 1024,
+					images: { maxPerRequest: model.contextWindow === 200000 ? 100 : 600 },
+				}
+			: model.provider === "amazon-bedrock"
+				? { images: { maxPerMessage: 20 } }
+				: model.provider === "openai"
+					? { maxRequestBytes: 512 * 1024 * 1024, images: { maxPerRequest: 1500 } }
+					: model.provider === "google"
+						? { maxRequestBytes: 20 * 1024 * 1024, images: { maxPerRequest: 3600 } }
+						: undefined;
+	const configuredImages = model.inputLimits?.images;
+	model.inputLimits = {
+		...providerLimits,
+		...model.inputLimits,
+		images: {
+			...providerLimits?.images,
+			...configuredImages,
+			resize: { ...DEFAULT_IMAGE_RESIZE, ...configuredImages?.resize },
+		},
+	};
+}
+
 function isGemma4Model(modelId: string): boolean {
 	return /gemma-?4/.test(modelId.toLowerCase());
 }
@@ -1024,7 +1084,11 @@ function applyThinkingLevelMetadata(model: Model<any>): void {
 	if (model.api === "anthropic-messages" && isAnthropicTemperatureUnsupportedModel(model.id)) {
 		mergeAnthropicMessagesCompat(model, { supportsTemperature: false });
 	}
-	if (model.api === "openai-completions" && model.id.includes("deepseek-v4")) {
+	if (
+		model.api === "openai-completions" &&
+		model.id.includes("deepseek-v4") &&
+		model.thinkingLevelMap === undefined
+	) {
 		mergeThinkingLevelMap(
 			model,
 			model.provider === "openrouter"
@@ -1266,6 +1330,21 @@ async function fetchOpenRouterModels(): Promise<Model<any>[]> {
 	}
 }
 
+async function fetchRadiusModels(): Promise<Model<"pi-messages">[]> {
+	try {
+		console.log("Fetching models from Radius API...");
+		const config = await loadRadiusGatewayConfig(DEFAULT_RADIUS_GATEWAY);
+		const models = getRadiusModelsFromConfig("radius", config);
+		if (models.length === 0) throw new Error("Radius API returned no models");
+		console.log(`Fetched ${models.length} models from Radius`);
+		return models;
+	} catch (error) {
+		console.error("Failed to fetch Radius models:", error);
+		if (generatorOptions.strict) throw error;
+		return [];
+	}
+}
+
 async function fetchAiGatewayModels(): Promise<Model<any>[]> {
 	try {
 		console.log("Fetching models from Vercel AI Gateway API...");
@@ -1306,6 +1385,7 @@ async function fetchAiGatewayModels(): Promise<Model<any>[]> {
 				provider: "vercel-ai-gateway",
 				reasoning: tags.includes("reasoning"),
 				input,
+				compat: { allowEmptySignature: true },
 				cost: {
 					input: inputCost,
 					output: outputCost,
@@ -1950,6 +2030,28 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					compat: { ...XAI_RESPONSES_COMPAT },
 					reasoning: m.reasoning === true,
 					input: m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
+					cost: getModelsDevCost(m.cost),
+					contextWindow: m.limit?.context || 4096,
+					maxTokens: m.limit?.output || 4096,
+				});
+				recordModelsDevReasoningOptions("xai", modelId, m);
+			}
+		}
+
+		// Process Meta models
+		if (data.meta?.models) {
+			for (const [modelId, model] of Object.entries(data.meta.models)) {
+				const m = model as ModelsDevModel;
+				if (m.tool_call !== true) continue;
+
+				models.push({
+					id: modelId,
+					name: m.name || modelId,
+					api: "openai-responses",
+					provider: "meta",
+					baseUrl: "https://api.meta.ai/v1",
+					reasoning: m.reasoning === true,
+					input: m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
 					cost: {
 						input: m.cost?.input || 0,
 						output: m.cost?.output || 0,
@@ -1959,7 +2061,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					contextWindow: m.limit?.context || 4096,
 					maxTokens: m.limit?.output || 4096,
 				});
-				recordModelsDevReasoningOptions("xai", modelId, m);
+				recordModelsDevReasoningOptions("meta", modelId, m);
 			}
 		}
 
@@ -2180,10 +2282,12 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					}
 				}
 
-				const thinkingLevelMap =
-					api === "google-generative-ai"
-						? getGoogleThinkingLevelMap(modelId, m.reasoning_options ?? [])
-						: undefined;
+				let thinkingLevelMap: NonNullable<Model<Api>["thinkingLevelMap"]> | undefined;
+				if (api === "google-generative-ai") {
+					thinkingLevelMap = getGoogleThinkingLevelMap(modelId, m.reasoning_options ?? []);
+				} else if (variant.provider === "opencode-go" && modelId === "deepseek-v4.1-flash") {
+					thinkingLevelMap = getEffortThinkingLevelMap(m.reasoning_options ?? []);
+				}
 				models.push({
 					id: modelId,
 					name: m.name || modelId,
@@ -2297,8 +2401,8 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 		}
 
 		// Process Kimi For Coding models
-		if (data["kimi-for-coding"]?.models) {
-			const kimiModels = data["kimi-for-coding"].models as Record<string, ModelsDevModel>;
+		if (data["kimi-code-plan-global"]?.models) {
+			const kimiModels = data["kimi-code-plan-global"].models as Record<string, ModelsDevModel>;
 			const hasCanonicalModel = Object.prototype.hasOwnProperty.call(kimiModels, "kimi-for-coding");
 
 			const kimiAliases = new Set(["k2p5", "k2p6", "k2p7"]);
@@ -2541,16 +2645,18 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 }
 
 async function generateModels() {
-	// Fetch models from both sources
-	// models.dev: Anthropic, Google, OpenAI, Groq, Cerebras
-	// OpenRouter: xAI and other providers (excluding Anthropic, Google, OpenAI)
+	// Fetch models from all upstream catalogs.
+	// models.dev: Anthropic, Google, OpenAI, Groq, Cerebras, and others
+	// OpenRouter: its tool-capable routed catalog
 	// AI Gateway: OpenAI-compatible catalog with tool-capable models
+	// Radius: its unauthenticated public catalog; authenticated clients overlay it at runtime
 	const modelsDevModels = await loadModelsDevData();
 	const openRouterModels = await fetchOpenRouterModels();
 	const aiGatewayModels = await fetchAiGatewayModels();
+	const radiusModels = await fetchRadiusModels();
 
-	// Combine models (models.dev has priority)
-	const allModels = [...modelsDevModels, ...openRouterModels, ...aiGatewayModels].filter(
+	// Combine models (models.dev has priority where sources overlap).
+	const allModels = [...modelsDevModels, ...openRouterModels, ...aiGatewayModels, ...radiusModels].filter(
 		(model) =>
 			!(model.provider === "xai" && XAI_BUILTIN_EXCLUDED_MODEL_IDS.has(model.id)) &&
 			!((model.provider === "opencode" || model.provider === "opencode-go") && model.id === "gpt-5.3-codex-spark"),
@@ -3026,6 +3132,8 @@ async function generateModels() {
 		applyOpenAICompletionsTranscriptMetadata(model);
 		applyOpenAIResponsesTranscriptMetadata(model);
 		applyOpenAIExplicitPromptCacheMetadata(model);
+		applyPromptCacheMetadata(model);
+		applyImageInputMetadata(model);
 	}
 	applyAnthropicAllowedFallbackModelMetadata(allModels.filter(isAnthropicFallbackMetadataModel));
 

@@ -8,11 +8,18 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.ts";
-import { createExtensionRuntime, discoverAndLoadExtensions, loadExtensions } from "../src/core/extensions/loader.ts";
+import { createEventBus } from "../src/core/event-bus.ts";
+import {
+	createExtensionRuntime,
+	discoverAndLoadExtensions,
+	loadExtensionFromFactory,
+	loadExtensions,
+} from "../src/core/extensions/loader.ts";
 import { ExtensionRunner, emitProjectTrustEvent } from "../src/core/extensions/runner.ts";
 import type {
 	ExtensionActions,
 	ExtensionContextActions,
+	ExtensionFactory,
 	ExtensionUIContext,
 	ProviderConfig,
 } from "../src/core/extensions/types.ts";
@@ -880,6 +887,149 @@ describe("ExtensionRunner", () => {
 		});
 	});
 
+	describe("boundary chaining", () => {
+		it("chains shared draft proposals and preserves omitted result fields", async () => {
+			const runtime = createExtensionRuntime();
+			const eventBus = createEventBus();
+			const observations: Array<{ entries: number; continuation: boolean; preview: number }> = [];
+			const first = await loadExtensionFromFactory(
+				(pi) => {
+					pi.on("agent_before_settle", (event) => {
+						observations.push({
+							entries: event.entries.length,
+							continuation: event.continue,
+							preview: event.context.contextEntries.length,
+						});
+						event.entries.push({ type: "custom", customType: "first", data: 1 });
+						return { continue: true };
+					});
+				},
+				tempDir,
+				eventBus,
+				runtime,
+				"<inline:first>",
+			);
+			const second = await loadExtensionFromFactory(
+				(pi) => {
+					pi.on("agent_before_settle", (event) => {
+						observations.push({
+							entries: event.entries.length,
+							continuation: event.continue,
+							preview: event.context.contextEntries.length,
+						});
+						return { entries: [] };
+					});
+				},
+				tempDir,
+				eventBus,
+				runtime,
+				"<inline:second>",
+			);
+			const runner = new ExtensionRunner([first, second], runtime, tempDir, sessionManager, modelRegistry);
+
+			const result = await runner.emitBoundary({ type: "agent_before_settle", outcome: "completed" }, (entries) => ({
+				contextEntries: entries.map((entry, index) => ({
+					sourceEntry: {
+						type: "custom",
+						id: `draft-${index}`,
+						parentId: null,
+						timestamp: "",
+						customType: entry.type,
+					},
+					messages: [],
+				})),
+				contextMessages: [],
+				llmMessages: [],
+				pendingMessages: [],
+				canContinue: false,
+			}));
+
+			expect(observations).toEqual([
+				{ entries: 0, continuation: false, preview: 0 },
+				{ entries: 1, continuation: true, preview: 1 },
+			]);
+			expect(result.entries).toEqual([]);
+			expect(result.continue).toBe(true);
+		});
+
+		it("reports invalid boundary previews and lets later handlers repair the proposal", async () => {
+			const runtime = createExtensionRuntime();
+			let secondRan = false;
+			const first = await loadExtensionFromFactory(
+				(pi) => {
+					pi.on("agent_before_settle", () => ({
+						entries: [{ type: "context_edit", targetId: "missing", replacement: null }],
+					}));
+				},
+				tempDir,
+				createEventBus(),
+				runtime,
+				"<inline:invalid>",
+			);
+			const second = await loadExtensionFromFactory(
+				(pi) => {
+					pi.on("agent_before_settle", (event) => {
+						secondRan = true;
+						expect(event.entries).toHaveLength(1);
+						return { entries: [] };
+					});
+				},
+				tempDir,
+				createEventBus(),
+				runtime,
+				"<inline:repair>",
+			);
+			const runner = new ExtensionRunner([first, second], runtime, tempDir, sessionManager, modelRegistry);
+			const errors: string[] = [];
+			runner.onError((error) => errors.push(error.error));
+
+			const result = await runner.emitBoundary({ type: "agent_before_settle", outcome: "completed" }, (entries) => {
+				if (entries.some((entry) => entry.type === "context_edit")) throw new Error("Entry missing not found");
+				return {
+					contextEntries: [],
+					contextMessages: [],
+					llmMessages: [],
+					pendingMessages: [],
+					canContinue: false,
+				};
+			});
+
+			expect(secondRan).toBe(true);
+			expect(errors).toContain("Invalid boundary entries: Entry missing not found");
+			expect(result.entries).toEqual([]);
+			expect(result.valid).toBe(true);
+		});
+
+		it("keeps shared mutations made before a handler throws", async () => {
+			const runtime = createExtensionRuntime();
+			const extension = await loadExtensionFromFactory(
+				(pi) => {
+					pi.on("agent_before_settle", (event) => {
+						event.entries.push({ type: "custom", customType: "kept" });
+						throw new Error("boundary failed");
+					});
+				},
+				tempDir,
+				createEventBus(),
+				runtime,
+			);
+			const runner = new ExtensionRunner([extension], runtime, tempDir, sessionManager, modelRegistry);
+			const errors: string[] = [];
+			runner.onError((error) => errors.push(error.error));
+
+			const result = await runner.emitBoundary({ type: "agent_before_settle", outcome: "completed" }, () => ({
+				contextEntries: [],
+				contextMessages: [],
+				llmMessages: [],
+				pendingMessages: [],
+				canContinue: false,
+			}));
+
+			expect(result.entries).toMatchObject([{ type: "custom", customType: "kept" }]);
+			expect(errors).toEqual(["boundary failed"]);
+		});
+	});
+
 	describe("tool_result chaining", () => {
 		it("chains content modifications across handlers", async () => {
 			const extCode1 = `
@@ -1065,6 +1215,127 @@ describe("ExtensionRunner", () => {
 
 			await commandContext.fork("entry-2", { position: "at" });
 			expect(fork).toHaveBeenLastCalledWith("entry-2", { position: "at" });
+		});
+	});
+
+	// #8967: event handler unsubscription must not disturb other registrations.
+	describe("event subscriptions", () => {
+		async function loadSubscriptionExtension(factory: ExtensionFactory) {
+			const runtime = createExtensionRuntime();
+			const extension = await loadExtensionFromFactory(factory, tempDir, createEventBus(), runtime);
+			const runner = new ExtensionRunner([extension], runtime, tempDir, sessionManager, modelRegistry);
+			return { extension, runner };
+		}
+
+		it("allows self-removal without skipping neighboring handlers", async () => {
+			const calls: string[] = [];
+			const { runner } = await loadSubscriptionExtension((pi) => {
+				const unsubscribe = pi.on("agent_end", () => {
+					calls.push("A");
+					unsubscribe();
+				});
+				pi.on("agent_end", () => {
+					calls.push("B");
+				});
+			});
+
+			await runner.emit({ type: "agent_end", messages: [] });
+			expect(calls).toEqual(["A", "B"]);
+
+			await runner.emit({ type: "agent_end", messages: [] });
+			expect(calls).toEqual(["A", "B", "B"]);
+		});
+
+		it("removes duplicate registrations independently and cleans up the last handler", async () => {
+			const calls: string[] = [];
+			const unsubscribers: Array<() => void> = [];
+			const { extension, runner } = await loadSubscriptionExtension((pi) => {
+				const shared = () => {
+					calls.push("shared");
+				};
+				unsubscribers.push(pi.on("agent_end", shared));
+				unsubscribers.push(
+					pi.on("agent_end", () => {
+						calls.push("B");
+					}),
+				);
+				unsubscribers.push(pi.on("agent_end", shared));
+			});
+			const [stopFirst, stopB, stopSecond] = unsubscribers;
+
+			stopSecond();
+			stopSecond();
+			await runner.emit({ type: "agent_end", messages: [] });
+			expect(calls).toEqual(["shared", "B"]);
+
+			stopFirst();
+			await runner.emit({ type: "agent_end", messages: [] });
+			expect(calls).toEqual(["shared", "B", "B"]);
+
+			stopB();
+			expect(extension.handlers.has("agent_end")).toBe(false);
+		});
+
+		it("keeps removed pending handlers in the current dispatch", async () => {
+			const calls: string[] = [];
+			const { runner } = await loadSubscriptionExtension((pi) => {
+				pi.on("agent_end", () => {
+					calls.push("A");
+					stopB();
+				});
+				const stopB = pi.on("agent_end", () => {
+					calls.push("B");
+				});
+				pi.on("agent_end", () => {
+					calls.push("C");
+				});
+			});
+
+			await runner.emit({ type: "agent_end", messages: [] });
+			expect(calls).toEqual(["A", "B", "C"]);
+			await runner.emit({ type: "agent_end", messages: [] });
+			expect(calls).toEqual(["A", "B", "C", "A", "C"]);
+		});
+
+		it("defers registrations made during dispatch until the next dispatch", async () => {
+			const calls: string[] = [];
+			const { runner } = await loadSubscriptionExtension((pi) => {
+				pi.on("agent_end", () => {
+					calls.push("A");
+					pi.on("agent_end", () => {
+						calls.push("C");
+					});
+				});
+				pi.on("agent_end", () => {
+					calls.push("B");
+				});
+			});
+
+			await runner.emit({ type: "agent_end", messages: [] });
+			expect(calls).toEqual(["A", "B"]);
+			await runner.emit({ type: "agent_end", messages: [] });
+			expect(calls).toEqual(["A", "B", "A", "B", "C"]);
+		});
+
+		it("uses a fresh handler list for nested dispatches", async () => {
+			const calls: string[] = [];
+			const { runner } = await loadSubscriptionExtension((pi) => {
+				const stopA = pi.on("agent_end", async () => {
+					calls.push("A");
+					stopA();
+					stopB();
+					pi.on("agent_end", () => {
+						calls.push("C");
+					});
+					await runner.emit({ type: "agent_end", messages: [] });
+				});
+				const stopB = pi.on("agent_end", () => {
+					calls.push("B");
+				});
+			});
+
+			await runner.emit({ type: "agent_end", messages: [] });
+			expect(calls).toEqual(["A", "C", "B"]);
 		});
 	});
 

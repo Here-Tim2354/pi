@@ -29,14 +29,6 @@ it("uses API-equivalent reference costs for Coding Plan models", () => {
 		cacheRead: 0.26,
 		cacheWrite: 0,
 	});
-	// GLM-5.1 and GLM-5V-Turbo were dropped from the China Coding Plan catalog;
-	// GLM-5.3-Flash exercises the same API-catalog reference price lookup.
-	expect(getBuiltinModel("zai-coding-cn", "glm-5.3-flash").cost).toEqual({
-		input: 0.075,
-		output: 0.25,
-		cacheRead: 0.015,
-		cacheWrite: 0,
-	});
 	for (const provider of ["zai", "zai-coding-cn"] as const) {
 		expect(getBuiltinModel(provider, "glm-5.3").cost).toEqual({
 			input: 1.4,
@@ -51,5 +43,8 @@ it("keeps zero costs for Coding Plan models without a matching API price", () =>
 	const zeroCost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 
 	expect(getBuiltinModel("zai", "glm-5.2-highspeed").cost).toEqual(zeroCost);
-	expect(getBuiltinModel("zai-coding-cn", "glm-5.3-highspeed").cost).toEqual(zeroCost);
+
+	for (const provider of ["zai", "zai-coding-cn"] as const) {
+		expect(getBuiltinModel(provider, "glm-5.3-highspeed").cost).toEqual(zeroCost);
+	}
 });

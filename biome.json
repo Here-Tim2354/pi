@@ -25,11 +25,14 @@
 	},
 	"files": {
 		"includes": [
+			"scripts/model-catalog-protocol.ts",
+			"scripts/model-catalog-protocol.test.ts",
 			"packages/*/src/**/*.ts",
 			"packages/*/test/**/*.ts",
 			"packages/session-backends/*/src/**/*.ts",
 			"packages/session-backends/*/test/**/*.ts",
 			"packages/coding-agent/examples/**/*.ts",
+			"packages/agent/examples/**/*.ts",
 			".pi/extensions-src/**/*.ts",
 			"!.pi/extensions-src/prompt-url-widget.ts",
 			"!**/node_modules/**/*",
@@ -39,5 +42,6 @@
 			"!packages/mom/data/**/*",
 			"!!**/node_modules"
 		]
-	}
+	},
+	"plugins": ["./scripts/biome/model-type-comparison.grit"]
 }

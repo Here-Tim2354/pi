@@ -38,12 +38,17 @@ import { pathToFileURL } from "node:url";
 
 // Publishable packages, same list as scripts/local-release.mjs (short names).
 // Includes the pre-rename storage package so snapshots of older global installs stay complete.
+// Packages that are not installed globally are skipped when the snapshot is taken.
 const PACKAGES = [
+	"chord",
 	"pi-ai",
 	"pi-tui",
 	"pi-agent-core",
 	"pi-protocol",
 	"pi-client",
+	"pi-durable",
+	"pi-server",
+	"pi-telemetry",
 	"pi-session-backend-sqlite-node",
 	"pi-storage-sqlite-node",
 	"pi-coding-agent",

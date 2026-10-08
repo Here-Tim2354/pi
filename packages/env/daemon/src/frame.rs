@@ -66,10 +66,11 @@ pub fn read_frame(input: &mut impl Read) -> io::Result<Option<Frame>> {
     if 9 + json_length > length {
         return Err(invalid("JSON length out of range"));
     }
+    // Unparseable JSON leaves the framing intact: the frame arrives with `Value::Null` and gets an error reply.
     let json = if json_length == 0 {
         Value::Object(Default::default())
     } else {
-        serde_json::from_slice(&body[9..9 + json_length]).map_err(|_| invalid("invalid JSON"))?
+        serde_json::from_slice(&body[9..9 + json_length]).unwrap_or(Value::Null)
     };
     let payload = body[9 + json_length..].to_vec();
     Ok(Some(Frame {
@@ -83,6 +84,9 @@ pub fn read_frame(input: &mut impl Read) -> io::Result<Option<Frame>> {
 pub fn write_frame(output: &mut impl Write, frame: &Frame) -> io::Result<()> {
     let json = serde_json::to_vec(&frame.json).map_err(|_| invalid("unserializable JSON"))?;
     let length = 9 + json.len() + frame.payload.len();
+    if length > MAX_FRAME {
+        return Err(invalid("frame too large"));
+    }
     let mut header = Vec::with_capacity(13);
     header.extend_from_slice(&(length as u32).to_be_bytes());
     header.push(frame.kind);

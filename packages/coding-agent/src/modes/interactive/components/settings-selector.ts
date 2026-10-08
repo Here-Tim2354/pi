@@ -807,7 +807,7 @@ export class SettingsSelectorComponent extends Container {
 		items.splice(skillCommandsIndex + 1, 0, {
 			id: "show-hardware-cursor",
 			label: "Show hardware cursor",
-			description: "Show the terminal cursor while still positioning it for IME support",
+			description: "Use the terminal cursor instead of Pi's drawn cursor",
 			currentValue: config.showHardwareCursor ? "true" : "false",
 			values: ["true", "false"],
 		});
@@ -827,7 +827,7 @@ export class SettingsSelectorComponent extends Container {
 		items.splice(editorPaddingIndex + 1, 0, {
 			id: "output-padding",
 			label: "Output padding",
-			description: "Horizontal padding for user messages, assistant messages, and thinking",
+			description: "Horizontal padding for messages, tool output, and command output",
 			currentValue: String(config.outputPad),
 			values: ["0", "1"],
 		});

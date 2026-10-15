@@ -2,12 +2,12 @@
  * check-model — probe model connectivity/availability from the TUI.
  *
  * Registers a `/check-model` slash command that sends a tiny completion request
- * to each model in a scope (concurrently) and reports reachability as a
- * green/red list in the transcript.
+ * to each model in a scope (concurrently) and shows reachability only in the
+ * interactive panel. Closing the panel discards the results without writing
+ * session entries, transcript messages, or LLM context.
  *
  * Usage:
  *   /check-model      interactive panel; Tab switches scope, Enter re-runs
- *   /check-model on   also inject the results into the LLM context
  *
  * Scopes (switch with Tab inside the panel; first activation auto-starts):
  *   scoped  models currently scoped to the session (ctx.scopedModels); falls
@@ -21,12 +21,7 @@
  *
  * Statuses: ok (green, seconds), timeout (no reply within 15s),
  * unavailable (API clearly rejected the model), error, no-auth, aborted.
- * The TUI only shows binary green/red; details live in the structured data.
- *
- * Context vs TUI: closing the panel stores results with pi.appendEntry() and
- * only renders them in the TUI. With `on` they are sent via pi.sendMessage():
- * `content` (compact JSON) becomes a user message for the LLM, while `details`
- * feeds the visual renderer only — the model never sees the green/red list.
+ * The TUI only shows binary green/red.
  */
 
 import type { Api, Model } from "@earendil-works/pi-ai";
@@ -39,8 +34,6 @@ import {
 	type Theme,
 } from "@earendil-works/pi-coding-agent";
 import {
-	type AutocompleteItem,
-	Box,
 	Container,
 	type Focusable,
 	fuzzyFilter,
@@ -54,7 +47,6 @@ import {
 	truncateToWidth,
 } from "@earendil-works/pi-tui";
 
-const CUSTOM_TYPE = "check-model";
 const PROBE_PROMPT = "Connectivity probe. Reply with the single word: ok";
 const CHECK_TIMEOUT_MS = 15_000;
 const AUTH_TIMEOUT_MS = 8_000;
@@ -85,24 +77,8 @@ interface CheckItem {
 	detail?: string;
 }
 
-interface CheckModelDetails {
-	result: "complete" | "cancelled";
-	scope: CheckScope;
-	scopeLabel: string;
-	checkedAt: string;
-	items: CheckItem[];
-}
-
 interface ScopeConfig {
 	models: Model<Api>[];
-	scopeLabel: string;
-}
-
-interface PanelScopeResult {
-	scope: CheckScope;
-	scopeLabel: string;
-	cancelled: boolean;
-	items: CheckItem[];
 }
 
 // -------------------------------------------------------------------------
@@ -270,12 +246,9 @@ function collectScopeConfigs(ctx: ExtensionCommandContext): {
 	warning?: string;
 } {
 	const available = ctx.modelRegistry.getAvailable();
-	const allConfig: ScopeConfig = { models: [...available], scopeLabel: `all (${available.length})` };
+	const allConfig: ScopeConfig = { models: [...available] };
 	const customModels = available.filter((model) => !BUILTIN_PROVIDER_IDS.has(model.provider));
-	const customConfig: ScopeConfig = {
-		models: customModels,
-		scopeLabel: `custom providers (${customModels.length})`,
-	};
+	const customConfig: ScopeConfig = { models: customModels };
 	const scoped = ctx.scopedModels.map((scopedModel) => scopedModel.model);
 	if (scoped.length === 0) {
 		return {
@@ -286,14 +259,14 @@ function collectScopeConfigs(ctx: ExtensionCommandContext): {
 		};
 	}
 	return {
-		scoped: { models: scoped, scopeLabel: `scoped (${scoped.length})` },
+		scoped: { models: scoped },
 		custom: customConfig,
 		all: allConfig,
 	};
 }
 
 // -------------------------------------------------------------------------
-// Rendering helpers (shared by the live panel and the transcript renderer)
+// Rendering helpers for the live panel
 // -------------------------------------------------------------------------
 
 // Explicit green instead of the theme's `success` token: some themes render it
@@ -353,12 +326,10 @@ interface ScopeState {
 	runId: number;
 	started: boolean;
 	running: boolean;
-	cancelled: boolean;
 	items: CheckItem[];
 	total: number;
 	done: number;
 	current: string;
-	scopeLabel: string;
 	models: Model<Api>[];
 	controller?: AbortController;
 }
@@ -373,7 +344,7 @@ class ModelCheckPanel extends Container implements Focusable {
 	private readonly authCache = new Map<string, Promise<AuthResolution>>();
 	private selectedIndex = 0;
 
-	public onFinish?: (results: PanelScopeResult[]) => void;
+	public onFinish?: () => void;
 
 	// Focusable implementation - propagate to searchInput for IME cursor positioning.
 	private _focused = false;
@@ -403,22 +374,20 @@ class ModelCheckPanel extends Container implements Focusable {
 		this.theme = theme;
 		this.registry = registry;
 		this.tabIndex = 0;
-		const emptyState = (scopeLabel: string, models: Model<Api>[]): ScopeState => ({
+		const emptyState = (models: Model<Api>[]): ScopeState => ({
 			runId: 0,
 			started: false,
 			running: false,
-			cancelled: false,
 			items: [],
 			total: models.length,
 			done: 0,
 			current: "",
-			scopeLabel,
 			models,
 		});
 		this.states = {
-			scoped: emptyState(scoped.scopeLabel, scoped.models),
-			custom: emptyState(custom.scopeLabel, custom.models),
-			all: emptyState(all.scopeLabel, all.models),
+			scoped: emptyState(scoped.models),
+			custom: emptyState(custom.models),
+			all: emptyState(all.models),
 		};
 
 		this.tabRowText = new Text("", 1, 0);
@@ -464,7 +433,6 @@ class ModelCheckPanel extends Container implements Focusable {
 		const runId = ++state.runId;
 		state.started = true;
 		state.running = true;
-		state.cancelled = false;
 		state.items = [];
 		state.total = state.models.length;
 		state.done = 0;
@@ -492,7 +460,6 @@ class ModelCheckPanel extends Container implements Focusable {
 		).then((items) => {
 			if (state.runId !== runId) return; // stale run after a rerun
 			state.running = false;
-			state.cancelled = controller.signal.aborted;
 			state.items = items;
 			this.refresh();
 			this.tui.requestRender();
@@ -503,22 +470,11 @@ class ModelCheckPanel extends Container implements Focusable {
 	private cancelAll(): void {
 		for (const scope of SCOPES) {
 			const state = this.states[scope]!;
-			if (state.running) {
-				state.controller?.abort();
-				state.running = false;
-				state.cancelled = true;
-			}
+			// Ignore pending callbacks after the panel is closed or disposed.
+			state.runId++;
+			state.controller?.abort();
+			state.running = false;
 		}
-	}
-
-	private collectResults(): PanelScopeResult[] {
-		const results: PanelScopeResult[] = [];
-		for (const scope of SCOPES) {
-			const state = this.states[scope]!;
-			if (!state.started) continue;
-			results.push({ scope, scopeLabel: state.scopeLabel, cancelled: state.cancelled, items: state.items });
-		}
-		return results;
 	}
 
 	private filteredItems(state: ScopeState): CheckItem[] {
@@ -628,7 +584,7 @@ class ModelCheckPanel extends Container implements Focusable {
 
 	private close(): void {
 		this.cancelAll();
-		this.onFinish?.(this.collectResults());
+		this.onFinish?.();
 	}
 
 	dispose(): void {
@@ -637,139 +593,27 @@ class ModelCheckPanel extends Container implements Focusable {
 }
 
 // -------------------------------------------------------------------------
-// Result rendering (TUI visualization; the LLM never sees this)
-// -------------------------------------------------------------------------
-
-function renderDetails(details: CheckModelDetails | undefined, expanded: boolean, theme: Theme, pad: number) {
-	const box = new Box(pad, 1, (text) => theme.bg("customMessageBg", text));
-	if (!details) {
-		box.addChild(new Text(theme.fg("muted", "Model check: no details"), 0, 0));
-		return box;
-	}
-	const title = theme.bold(theme.fg("accent", `Model check · ${details.scopeLabel}`));
-	box.addChild(new Text(`${title}  ${theme.fg("muted", "·")}  ${summaryLine(details.items, theme)}`, 0, 0));
-	box.addChild(new Text(theme.fg("dim", new Date(details.checkedAt).toLocaleString()), 0, 0));
-	box.addChild(new Text("", 0, 0));
-	for (const item of details.items) {
-		box.addChild(new Text(formatItemLine(item, theme, LINE_WIDTH), 0, 0));
-		if (expanded && item.detail) {
-			box.addChild(new Text(theme.fg("dim", `    ${item.detail}`), 0, 0));
-		}
-	}
-	if (details.result === "cancelled") {
-		box.addChild(new Text("", 0, 0));
-		box.addChild(new Text(theme.fg("warning", "Cancelled — partial results shown."), 0, 0));
-	}
-	return box;
-}
-
-// -------------------------------------------------------------------------
-// LLM-facing structured content (what the model receives when `on` is used)
-// -------------------------------------------------------------------------
-
-function buildContextContent(details: CheckModelDetails): string {
-	const count = (status: ItemStatus): number => details.items.filter((item) => item.status === status).length;
-	return JSON.stringify({
-		type: "model-check",
-		checkedAt: details.checkedAt,
-		scope: details.scopeLabel,
-		summary: {
-			total: details.items.length,
-			ok: count("ok"),
-			timeout: count("timeout"),
-			unavailable: count("unavailable"),
-			error: count("error"),
-			noAuth: count("no-auth"),
-			cancelled: count("aborted"),
-		},
-		items: details.items.map((item) => ({
-			model: item.model,
-			status: item.status,
-			...(item.latencyMs !== undefined ? { latencyMs: item.latencyMs } : {}),
-			...(item.status === "ok" && item.saidOk === false ? { note: "responded but did not reply with ok" } : {}),
-			...(item.detail ? { detail: item.detail } : {}),
-		})),
-	});
-}
-
-// -------------------------------------------------------------------------
 // Extension
 // -------------------------------------------------------------------------
 
 export default function checkModelExtension(pi: ExtensionAPI): void {
-	pi.registerMessageRenderer<CheckModelDetails>(CUSTOM_TYPE, (message, { expanded, outputPad }, theme) =>
-		renderDetails(message.details, expanded, theme, outputPad),
-	);
-
-	pi.registerEntryRenderer<CheckModelDetails>(CUSTOM_TYPE, (entry, { expanded }, theme) =>
-		renderDetails(entry.data, expanded, theme, 0),
-	);
-
 	pi.registerCommand("check-model", {
-		description: "Check model connectivity/availability (Tab switches scope, Enter re-runs)",
-		getArgumentCompletions: (prefix: string): AutocompleteItem[] | null => {
-			const items: AutocompleteItem[] = [{ value: "on", label: "on — also inject results into LLM context" }];
-			const filtered = items.filter((item) => item.value.startsWith(prefix));
-			return filtered.length > 0 ? filtered : null;
-		},
+		description: "Check model connectivity/availability in a temporary panel (Tab switches scope, Enter re-runs)",
 		handler: async (args, ctx) => {
-			const tokens = args.trim().split(/\s+/).filter(Boolean);
-			const unknown = tokens.filter((token) => token !== "on");
-			if (unknown.length > 0) {
-				ctx.ui.notify(
-					`Unknown argument "${unknown[0]}". Usage: /check-model [on] — switch scope with Tab in the panel.`,
-					"error",
-				);
+			if (args.trim()) {
+				ctx.ui.notify("/check-model does not accept arguments. Switch scope with Tab in the panel.", "error");
 				return;
 			}
-			const intoContext = tokens.includes("on");
-
-			const writeResults = (results: PanelScopeResult[]): void => {
-				for (const scopeResult of results) {
-					if (scopeResult.items.length === 0) continue;
-					const details: CheckModelDetails = {
-						result: scopeResult.cancelled ? "cancelled" : "complete",
-						scope: scopeResult.scope,
-						scopeLabel: scopeResult.scopeLabel,
-						checkedAt: new Date().toISOString(),
-						items: scopeResult.items,
-					};
-					if (intoContext) {
-						pi.sendMessage({
-							customType: CUSTOM_TYPE,
-							content: buildContextContent(details),
-							display: true,
-							details,
-						});
-					} else {
-						pi.appendEntry<CheckModelDetails>(CUSTOM_TYPE, details);
-					}
-				}
-			};
-
-			if (ctx.mode !== "tui") {
-				const configs = collectScopeConfigs(ctx);
-				const items = await runChecks(
-					configs.scoped.models,
-					ctx.modelRegistry,
-					new AbortController().signal,
-					new Map(),
-					() => {},
-					() => {},
-				);
-				writeResults([{ scope: "scoped", scopeLabel: configs.scoped.scopeLabel, cancelled: false, items }]);
-				return;
-			}
+			if (ctx.mode !== "tui") return;
 
 			const { scoped, custom, all, warning } = collectScopeConfigs(ctx);
 			if (warning) ctx.ui.notify(warning, "warning");
 
-			const results = await ctx.ui.custom<PanelScopeResult[]>((tui, theme, _keybindings, done) => {
+			await ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
 				const panel = new ModelCheckPanel(tui, theme, ctx.modelRegistry, scoped, custom, all);
-				panel.onFinish = (panelResults) => done(panelResults);
+				panel.onFinish = () => done();
 				return panel;
 			});
-			writeResults(results);
 		},
 	});
 }

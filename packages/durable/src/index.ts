@@ -1,3 +1,4 @@
+export type { WatchEnd, WatchHandle } from "@earendil-works/chord";
 export { defineDoc, defineDocFamily } from "./documents.ts";
 export {
 	AssistantEntry,
@@ -8,7 +9,7 @@ export {
 	ToolResultEntry,
 	UserEntry,
 } from "./entries.ts";
-export { ConversationBusy, ReadAfterWrite, SessionFailed, StorageRequestError } from "./errors.ts";
+export { ConversationBusy, ReadAfterWrite, ReadOnlySession, SessionFailed, StorageRequestError } from "./errors.ts";
 export {
 	AgentDoc,
 	configure,
@@ -129,6 +130,8 @@ export { defineTask } from "./tasks.ts";
 export type {
 	CheckpointInfo,
 	CommitChange,
+	CommitOptions,
+	CommitPersistence,
 	CommitPublication,
 	CommonDocDefinition,
 	ContextEdit,
@@ -155,7 +158,6 @@ export type {
 	DocumentReader,
 	DocumentRecord,
 	DocumentSemantics,
-	DocumentState,
 	DocumentWatch,
 	Entry,
 	EntryDraft,
@@ -210,7 +212,5 @@ export type {
 	Tx,
 	TypedEntry,
 	TypedEntryDraft,
-	WatchEnd,
-	WatchHandle,
 } from "./types.ts";
 export { ROOT_CONVERSATION_ID } from "./types.ts";

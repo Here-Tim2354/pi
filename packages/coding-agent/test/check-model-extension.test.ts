@@ -1,5 +1,5 @@
 import { fileURLToPath } from "node:url";
-import type { Model } from "@earendil-works/pi-ai";
+import type { AssistantMessage, Model } from "@earendil-works/pi-ai";
 import type { Component, TUI } from "@earendil-works/pi-tui";
 import { describe, expect, it, vi } from "vitest";
 import { loadExtensions } from "../src/core/extensions/loader.ts";
@@ -90,6 +90,7 @@ async function setup(mode: ExtensionCommandContext["mode"] = "tui") {
 		custom,
 		getAvailable,
 		getProviderAuthStatus,
+		getApiKeyAndHeaders,
 		complete,
 		setInteraction: (handler: typeof interact) => {
 			interact = handler;
@@ -98,6 +99,37 @@ async function setup(mode: ExtensionCommandContext["mode"] = "tui") {
 }
 
 describe("check-model panel-only results", () => {
+	it("uses the actual auth resolution instead of a stale provider status snapshot", async () => {
+		const fixture = await setup();
+		fixture.complete.mockResolvedValue({
+			role: "assistant",
+			content: [{ type: "text", text: "ok" }],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: {
+				input: 1,
+				output: 1,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 2,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: Date.now(),
+		} satisfies AssistantMessage);
+		fixture.setInteraction(async (panel) => {
+			await vi.waitFor(() => expect(panel.render(100).join("\n")).toContain("1 checked"));
+			const rendered = panel.render(100).join("\n");
+			expect(rendered).toContain("✓");
+			expect(rendered).not.toContain("✗");
+			panel.handleInput?.("\x1b");
+		});
+		await fixture.command.handler("", fixture.ctx);
+		expect(fixture.complete).toHaveBeenCalledOnce();
+		expect(fixture.getProviderAuthStatus).not.toHaveBeenCalled();
+	}, 10_000);
+
 	it.each(["escape", "ctrl+c"])("discards completed results when closed with %s", async (key) => {
 		const fixture = await setup();
 		fixture.setInteraction(async (panel) => {
@@ -113,7 +145,6 @@ describe("check-model panel-only results", () => {
 
 	it("does not persist partial results or render after closing an active check", async () => {
 		const fixture = await setup();
-		fixture.getProviderAuthStatus.mockReturnValue({ configured: true });
 		let probeSignal: AbortSignal | undefined;
 		fixture.complete.mockImplementation(
 			(_model, _context, options) =>
@@ -145,7 +176,7 @@ describe("check-model panel-only results", () => {
 			panel.handleInput?.("\t");
 			await vi.waitFor(() => expect(panel.render(100).join("\n")).toContain("1 checked"));
 			panel.handleInput?.("\r");
-			await vi.waitFor(() => expect(fixture.getProviderAuthStatus).toHaveBeenCalledTimes(4));
+			await vi.waitFor(() => expect(fixture.getApiKeyAndHeaders).toHaveBeenCalledTimes(2));
 			panel.handleInput?.("unmatched");
 			expect(panel.render(100).join("\n")).toContain("No matching models");
 			panel.handleInput?.("\x03");

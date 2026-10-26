@@ -137,10 +137,6 @@ async function checkModel(
 ): Promise<CheckItem> {
 	const base: CheckItem = { model: `${model.provider}/${model.id}`, provider: model.provider, status: "ok" };
 
-	if (!registry.getProviderAuthStatus(model.provider).configured) {
-		return { ...base, status: "no-auth", detail: `Provider "${model.provider}" is not configured` };
-	}
-
 	try {
 		const auth = await getAuthCached(model, registry, authCache);
 		if (!auth.ok) return { ...base, status: "no-auth", detail: auth.error };

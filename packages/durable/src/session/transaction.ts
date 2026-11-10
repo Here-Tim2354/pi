@@ -1,6 +1,14 @@
-import { type Context, copyJson, type Draft, type JsonValue } from "@earendil-works/chord";
-import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { type Change, type Op, type PendingOps, type Prepared, type Tracker, track } from "@earendil-works/chord/delta";
+import { BACKGROUND_CONTEXT, type Context } from "@earendil-works/chord/context";
+import {
+	type Change,
+	type Draft,
+	type Op,
+	type PendingOps,
+	type Prepared,
+	type Tracker,
+	track,
+} from "@earendil-works/chord/delta";
+import { copyJson, type JsonValue } from "@earendil-works/chord/json";
 import type { TelemetryCarrier } from "@earendil-works/pi-telemetry";
 import {
 	type AnyDocDefinition,
@@ -57,6 +65,7 @@ import type {
 } from "../types.ts";
 import { ROOT_CONVERSATION_ID } from "../types.ts";
 import { prepareForkDocumentCopies } from "./forks.ts";
+import { documentKey, incarnationKey, scopeKey, tableKeys } from "./keys.ts";
 
 type AnyTaskRecord = TaskRecord<JsonValue, JsonValue, JsonValue>;
 
@@ -64,8 +73,8 @@ type AnyTaskRecord = TaskRecord<JsonValue, JsonValue, JsonValue>;
 type SubmissionChange = SubmissionSettlement | { readonly status: "placed"; readonly entry: EntryId };
 
 /**
- * Complete record after applying one change. Placement turns a queued input `placed` and a queued write `done`; only a
- * placed input can be answered. A settled record stays.
+ * Complete record after applying one change. Placement turns a queued input `placed` and a queued write `done`; a
+ * continue is never queued, so never placed. Only a placed input or continue can be answered. A settled record stays.
  */
 function applySubmissionChange(current: SubmissionRecord, change: SubmissionChange): SubmissionRecord {
 	if (current.status === "done" || current.status === "unanswered") return current;
@@ -75,7 +84,7 @@ function applySubmissionChange(current: SubmissionRecord, change: SubmissionChan
 		return { ...current, status, entry: change.entry } as SubmissionRecord;
 	}
 	if (change.status === "done" && current.status !== "placed") {
-		throw new Error(`Submission ${current.id} is not a placed input`);
+		throw new Error(`Submission ${current.id} is not a placed input or continue`);
 	}
 	// Queued and placed records carry no answer, reason, or detail; an unanswered input keeps its entry.
 	return { ...current, ...change } as SubmissionRecord;
@@ -109,7 +118,7 @@ export type HeldDocument = {
 	base: boolean;
 };
 
-/** What adoption publishes: to the Session's own observers, and the stored changes to `subscribeCommits()`. */
+/** What adoption publishes: to the Session's own observers, and the stored changes to `observeCommits()`. */
 export type AdoptedDocuments = {
 	/** This commit's own changes, as memory adopted them. */
 	readonly observed: readonly DocumentCommitChange[];
@@ -119,7 +128,10 @@ export type AdoptedDocuments = {
 
 /** Session services used by a transaction while it holds the mutation line. */
 export interface TransactionHost {
+	/** Reads wait while their key has an unpublished writer (`GatedStorage`). */
 	readonly storage: Storage;
+	/** Wait while `key` has an unpublished writer; `undefined` when it has none. */
+	touch(key: string): Promise<void> | undefined;
 	/** Wall clock for task lifecycle times. */
 	now(): number;
 	/** Return the cached current incarnation without loading. */
@@ -137,6 +149,17 @@ export interface TransactionHost {
 	evict(addressId: string, recordId: DocumentId): void;
 	/** Stage writes that belong to every newly created or forked conversation, in its creating transaction. */
 	conversationCreated(tx: Transaction, record: ConversationRecord): Promise<void>;
+	/** The newest entry ID visible from a conversation, known from the Session's commits. */
+	latestEntryId(conversationId: ConversationId, context: Context): Promise<EntryId | undefined>;
+	/**
+	 * The current documents of a live task when the Session knows all of them (it created the task), else `undefined`.
+	 */
+	taskDocuments(taskId: TaskId): Iterable<DocumentRecord> | undefined;
+	/** The newest visible head marker of a conversation, known from the Session's commits. */
+	latestHeadMarker(
+		conversationId: ConversationId,
+		context: Context,
+	): Promise<(EntryRecord & { readonly head: EntryId }) | undefined>;
 }
 
 /** Committed and candidate state for one task touched by this transaction. */
@@ -254,6 +277,24 @@ export class Transaction implements Tx {
 		this.#scope = scope;
 	}
 
+	/** Internal: the context of the commit this transaction belongs to. */
+	get context(): Context {
+		return this.#context;
+	}
+
+	/** Internal: whether a table write was staged, after which table reads throw `ReadAfterWrite`. */
+	get hasTableWrite(): boolean {
+		return this.#hasTableWrite;
+	}
+
+	/**
+	 * Internal: whether `tx` is a transaction of a commit of the Session behind `host`. A brand check, so a proxy or
+	 * another wrapper of a transaction is not one.
+	 */
+	static ownedBy(tx: Tx, host: TransactionHost): tx is Transaction {
+		return #host in tx && tx.#host === host;
+	}
+
 	// ─── Table reads ────────────────────────────────────────────────────────
 
 	conversation(id: ConversationId): Promise<ConversationRecord | undefined> {
@@ -286,16 +327,18 @@ export class Transaction implements Tx {
 	}
 
 	latestHeadMarker(conversationId: ConversationId) {
-		return this.#read("latestHeadMarker", () =>
-			this.#host.storage.findLatestHeadMarker(conversationId, undefined, this.#context),
-		);
+		return this.#read("latestHeadMarker", () => this.#host.latestHeadMarker(conversationId, this.#context));
+	}
+
+	latestEntryId(conversationId: ConversationId): Promise<EntryId | undefined> {
+		return this.#read("latestEntryId", () => this.#host.latestEntryId(conversationId, this.#context));
 	}
 
 	scanTasks(query: TaskQuery, limit: number, cursor?: Cursor) {
 		return this.#read("scanTasks", () => this.#host.storage.scanTasks(query, limit, cursor, this.#context));
 	}
 
-	/** Internal: committed submission record. */
+	/** Committed submission record. */
 	submission(id: SubmissionId): Promise<SubmissionRecord | undefined> {
 		return this.#read("submission", () => this.#host.storage.submission(id, this.#context));
 	}
@@ -530,6 +573,13 @@ export class Transaction implements Tx {
 		return records;
 	}
 
+	/** Internal: IDs of the tasks this transaction creates. */
+	createdTaskIds(): TaskId[] {
+		const ids: TaskId[] = [];
+		for (const [id, task] of this.#tasksById) if (task.write?.kind === "create") ids.push(id);
+		return ids;
+	}
+
 	/** Internal: conversations this transaction created or forked so far. */
 	stagedConversations(): ConversationRecord[] {
 		const records: ConversationRecord[] = [];
@@ -699,6 +749,8 @@ export class Transaction implements Tx {
 	}
 
 	async #findRetirement(entry: DocumentEntry): Promise<void> {
+		const gate = this.#host.touch(documentKey(entry.addressId));
+		if (gate !== undefined) await gate;
 		const record =
 			this.#host.cached(entry.addressId)?.record ??
 			(await this.#host.storage.findDocument(entry.address, "current", this.#context));
@@ -791,6 +843,7 @@ export class Transaction implements Tx {
 			const conversationId = plan.conversationId;
 			publications.push({
 				type: "document",
+				kind: "change",
 				record,
 				conversationId,
 				version,
@@ -829,6 +882,22 @@ export class Transaction implements Tx {
 			if (plan.record.scope.kind === "conversation") plan.conversationId = plan.record.scope.conversationId;
 		}
 		return taken;
+	}
+
+	/**
+	 * Internal: the keys this commit writes, once settled (and after `takeHeld()`), for the Session's unpublished write
+	 * set: its table records, and the address and incarnation of every document it creates, changes, or retires, with
+	 * the scope of every incarnation it creates or retires.
+	 */
+	writeKeys(): string[] {
+		const keys: string[] = [];
+		tableKeys(this.#writes, keys);
+		for (const plan of this.#plans) {
+			if (plan.content === undefined && !plan.retire) continue;
+			keys.push(documentKey(plan.addressId), incarnationKey(plan.record.id));
+			if (plan.retire || !("createdAt" in plan.record)) keys.push(scopeKey(plan.record.scope));
+		}
+		return keys;
 	}
 
 	/** Stage a content write for an incarnation, before its retirement when it retires. */
@@ -883,8 +952,12 @@ export class Transaction implements Tx {
 			}
 			stored ??= [...publications];
 			if (held.observed) publications.push(publication);
-			// Only a document change of a loaded incarnation carries held operations.
-			stored.push(publication.type === "document" ? { ...publication, ops: held.ops } : publication);
+			// Only a document change of a loaded incarnation carries held operations; a retirement is published alone.
+			stored.push(
+				publication.type === "document" && publication.kind === "change"
+					? { ...publication, ops: held.ops }
+					: publication,
+			);
 		}
 		return { observed: publications, stored: stored ?? publications };
 	}
@@ -921,8 +994,21 @@ export class Transaction implements Tx {
 				plan.retire = true;
 				retiring.add(plan.record.id);
 			}
+			const retire = (record: DocumentRecord): void => {
+				if (retiring.has(record.id)) return;
+				plans.push({ addressId: addressId(record), record, retire: true });
+				retiring.add(record.id);
+			};
 			for (const taskId of terminalTaskIds) {
 				if (this.#tasksById.get(taskId)?.write?.kind === "create") continue;
+				// The Session knows the documents of the tasks it created; any other task's are scanned.
+				const gate = this.#host.touch(scopeKey({ kind: "task", taskId }));
+				if (gate !== undefined) await gate;
+				const known = this.#host.taskDocuments(taskId);
+				if (known !== undefined) {
+					for (const record of known) retire(record);
+					continue;
+				}
 				let cursor: Cursor | undefined;
 				do {
 					const page = await storage.scanDocuments(
@@ -931,11 +1017,7 @@ export class Transaction implements Tx {
 						cursor,
 						this.#context,
 					);
-					for (const record of page.items) {
-						if (retiring.has(record.id)) continue;
-						plans.push({ addressId: addressId(record), record, retire: true });
-						retiring.add(record.id);
-					}
+					for (const record of page.items) retire(record);
 					cursor = page.next;
 				} while (cursor !== undefined);
 			}
@@ -1058,7 +1140,7 @@ export class Transaction implements Tx {
 	#read<T>(method: string, read: () => Promise<T>): Promise<T> {
 		try {
 			this.#assertOpen();
-			if (this.#hasTableWrite) throw new ReadAfterWrite(method);
+			if (this.#hasTableWrite) throw new ReadAfterWrite(`Tx.${method}()`);
 			return this.#track(read());
 		} catch (error) {
 			return Promise.reject(error);
@@ -1173,15 +1255,22 @@ function planDocument(document: DocumentEntry): DocumentPlan | undefined {
 /** The publication of one adopted plan, if it publishes (`publishes()`), with `record` as committed. */
 function describe(plan: DocumentPlan, record: DocumentRecord): DocumentCommitChange | undefined {
 	const conversationId = plan.conversationId;
-	if (plan.retire)
-		return { type: "document", record, conversationId, version: undefined, value: null, ops: EMPTY_OPERATIONS };
+	if (plan.retire) return { type: "document", kind: "retire", record, conversationId };
 	if (plan.content?.type === "document.copy") {
 		return { type: "document.copy", record, conversationId: conversationId!, source: plan.content.source };
 	}
 	const change = plan.change;
 	if (change === undefined || !publishes(plan)) return undefined;
 	const ops = change.loaded === undefined ? EMPTY_OPERATIONS : change.prepared.ops;
-	return { type: "document", record, conversationId, version: change.version, value: change.prepared.value, ops };
+	return {
+		type: "document",
+		kind: "change",
+		record,
+		conversationId,
+		version: change.version,
+		value: change.prepared.value,
+		ops,
+	};
 }
 
 /**

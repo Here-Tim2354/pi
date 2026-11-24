@@ -6,6 +6,7 @@ import {
 	type Content,
 	FinishReason,
 	FunctionCallingConfigMode,
+	type GenerateContentResponsePromptFeedback,
 	ThinkingLevel as GoogleSdkThinkingLevel,
 	type Part,
 	type ThinkingConfig,
@@ -76,7 +77,7 @@ export function usesGoogleThinkingLevel<T extends GoogleApiType>(model: Model<T>
 		// gemini-3-flash-preview, gemini-3.1-pro-preview, and gemini-3.8-flash.
 		/gemini-3(?:\.\d+)?-(?:pro|flash)/.test(id) ||
 		// Match Gemini 4 and later, such as gemini-4-argon (#10890).
-		/gemini-(?:[4-9]|[1-9]\d)/.test(id) ||
+		(getGeminiMajorVersion(id) ?? 0) >= 4 ||
 		id === "gemini-flash-latest" ||
 		id === "gemini-flash-lite-latest" ||
 		// Match both hosted Gemma 4 naming forms: gemma-4-* and gemma4-*.
@@ -174,7 +175,8 @@ export function requiresToolCallId(modelId: string): boolean {
 }
 
 function getGeminiMajorVersion(modelId: string): number | undefined {
-	const match = modelId.toLowerCase().match(/^gemini(?:-live)?-(\d+)/);
+	// Unanchored like usesGoogleThinkingLevel: some hosts prefix the ID, e.g. randomprefix-gemini-4-argon (#12321).
+	const match = modelId.toLowerCase().match(/gemini(?:-live)?-(\d+)/);
 	if (!match) return undefined;
 	return Number.parseInt(match[1], 10);
 }
@@ -459,10 +461,13 @@ export function convertTools(
 	];
 }
 
-/** Gemini 3+ enforces required function parameters in validated tool-calling modes. */
-export function supportsGoogleStrictToolSampling(modelId: string): boolean {
-	const majorVersion = getGeminiMajorVersion(modelId);
-	return majorVersion !== undefined && majorVersion >= 3;
+/**
+ * Gemini 3+ enforces required function parameters in validated tool-calling modes.
+ * `compat.supportsStrictMode` overrides the model ID detection, e.g. for Gemini models served under IDs without the version.
+ */
+export function supportsGoogleStrictToolSampling<T extends GoogleApiType>(model: Model<T>): boolean {
+	const majorVersion = getGeminiMajorVersion(model.id);
+	return model.compat?.supportsStrictMode ?? (majorVersion !== undefined && majorVersion >= 3);
 }
 
 /** Map tool choice string to Gemini FunctionCallingConfigMode. */
@@ -494,6 +499,24 @@ export function resolveGoogleFunctionCallingMode(
 	return toolChoice ? mapToolChoice(toolChoice) : undefined;
 }
 
+/** Format prompt-block metadata returned instead of response candidates. */
+export function formatGooglePromptBlockError(
+	providerName: string,
+	feedback: GenerateContentResponsePromptFeedback,
+): string {
+	const details = [`${providerName} prompt blocked: ${feedback.blockReason ?? "unknown reason"}`];
+	if (feedback.blockReasonMessage) details.push(feedback.blockReasonMessage);
+	if (feedback.safetyRatings?.length) {
+		const ratings = feedback.safetyRatings.flatMap((rating) =>
+			rating.category ? [`${rating.category}${rating.probability ? ` (${rating.probability})` : ""}`] : [],
+		);
+		if (ratings.length > 0) {
+			details.push(`Safety rating${ratings.length === 1 ? "" : "s"}: ${ratings.join(", ")}`);
+		}
+	}
+	return details.join(". ");
+}
+
 /**
  * Map Gemini FinishReason to our StopReason.
  */
@@ -502,6 +525,8 @@ export function mapStopReason(reason: FinishReason): StopReason {
 		case FinishReason.STOP:
 			return "stop";
 		case FinishReason.MAX_TOKENS:
+		// Per-request token limit reached before generation completed; pi does not resume with the continuation token.
+		case FinishReason.CONTINUATION:
 			return "length";
 		case FinishReason.BLOCKLIST:
 		case FinishReason.PROHIBITED_CONTENT:
@@ -524,20 +549,6 @@ export function mapStopReason(reason: FinishReason): StopReason {
 			const _exhaustive: never = reason;
 			throw new Error(`Unhandled stop reason: ${_exhaustive}`);
 		}
-	}
-}
-
-/**
- * Map string finish reason to our StopReason (for raw API responses).
- */
-export function mapStopReasonString(reason: string): StopReason {
-	switch (reason) {
-		case "STOP":
-			return "stop";
-		case "MAX_TOKENS":
-			return "length";
-		default:
-			return "error";
 	}
 }
 

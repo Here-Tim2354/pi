@@ -2,12 +2,14 @@ import {
 	type GenerateContentConfig,
 	type GenerateContentParameters,
 	GoogleGenAI,
+	type HttpOptions,
 	type ThinkingConfig,
 } from "@google/genai";
 import { calculateCost, clampThinkingLevel } from "../models.ts";
 import type {
 	Api,
 	AssistantMessage,
+	FetchFunction,
 	Model,
 	ProviderHeaders,
 	SimpleStreamOptions,
@@ -30,6 +32,7 @@ import type { GoogleApiThinkingLevel, ResolvedGoogleThinkingLevel } from "./goog
 import {
 	convertMessages,
 	convertTools,
+	formatGooglePromptBlockError,
 	getDisabledGoogleThinkingConfig,
 	isThinkingPart,
 	mapStopReason,
@@ -84,14 +87,11 @@ export const stream: StreamFunction<"google-generative-ai", GoogleOptions> = (
 		};
 
 		try {
-			if (options?.fetch && options.fetch !== globalThis.fetch) {
-				throw new Error("Custom fetch is not supported by the Google Generative AI adapter");
-			}
 			const apiKey = options?.apiKey;
 			if (!apiKey) {
 				throw new Error(`No API key for provider: ${model.provider}`);
 			}
-			const client = createClient(model, apiKey, options?.headers, options?.identity);
+			const client = createClient(model, apiKey, options?.headers, options?.identity, options?.fetch);
 			let params = buildParams(model, normalizedContext, options);
 			const nextParams = await options?.onPayload?.(params, model);
 			if (nextParams !== undefined) {
@@ -101,10 +101,16 @@ export const stream: StreamFunction<"google-generative-ai", GoogleOptions> = (
 
 			stream.push({ type: "start", partial: output });
 			let currentBlock: TextContent | ThinkingContent | null = null;
+			let receivedChunkCount = 0;
+			let promptBlockError: string | undefined;
 			const blocks = output.content;
 			const blockIndex = () => blocks.length - 1;
 			for await (const chunk of googleStream) {
 				await options?.onProviderStreamEvent?.(chunk, model);
+				receivedChunkCount++;
+				if (chunk.promptFeedback?.blockReason) {
+					promptBlockError ??= formatGooglePromptBlockError("Google", chunk.promptFeedback);
+				}
 				// @google/genai documents GenerateContentResponse.responseId as an output-only field
 				// used to identify each response. Keep the first non-empty one from the stream.
 				output.responseId ||= chunk.responseId;
@@ -274,7 +280,11 @@ export const stream: StreamFunction<"google-generative-ai", GoogleOptions> = (
 			}
 
 			if (output.stopReason === "pending") {
-				throw new Error("Google stream ended without a finish reason");
+				if (promptBlockError) throw new Error(promptBlockError);
+				const chunkLabel = receivedChunkCount === 1 ? "chunk" : "chunks";
+				throw new Error(
+					`Google stream ended without a finish reason after receiving ${receivedChunkCount} ${chunkLabel}`,
+				);
 			}
 			if (output.stopReason === "aborted" || output.stopReason === "error") {
 				const errorMessage = output.rawStopReason
@@ -344,8 +354,11 @@ function createClient(
 	apiKey?: string,
 	optionsHeaders?: ProviderHeaders,
 	identity?: ClientIdentity,
+	fetch?: FetchFunction,
 ): GoogleGenAI {
-	const httpOptions: { baseUrl?: string; apiVersion?: string; headers?: Record<string, string> } = {};
+	// Always pass fetch: without one, @google/genai adds a per-request dispatcher that disables
+	// undici's header and body timeouts, bypassing the idle timeouts of the global dispatcher.
+	const httpOptions: HttpOptions = { fetch: fetch ?? globalThis.fetch };
 	if (model.baseUrl) {
 		httpOptions.baseUrl = model.baseUrl;
 		httpOptions.apiVersion = ""; // baseUrl already includes version path, don't append
@@ -355,10 +368,7 @@ function createClient(
 		httpOptions.headers = headers;
 	}
 
-	return new GoogleGenAI({
-		apiKey,
-		httpOptions: Object.keys(httpOptions).length > 0 ? httpOptions : undefined,
-	});
+	return new GoogleGenAI({ apiKey, httpOptions });
 }
 
 function buildParams(
@@ -378,7 +388,7 @@ function buildParams(
 		generationConfig.maxOutputTokens = options.maxTokens;
 	}
 
-	const supportsStrictMode = supportsGoogleStrictToolSampling(model.id);
+	const supportsStrictMode = supportsGoogleStrictToolSampling(model);
 	const functionCallingMode =
 		currentTools.length > 0
 			? resolveGoogleFunctionCallingMode(currentTools, options.toolChoice, supportsStrictMode)
@@ -393,6 +403,9 @@ function buildParams(
 		...(functionCallingMode !== undefined && {
 			toolConfig: { functionCallingConfig: { mode: functionCallingMode } },
 		}),
+		// Off for now, until we have evaluated the implications of the SDK's automatic continuation
+		// (extra requests and stream resumes inside the SDK). A CONTINUATION finish ends the turn as "length".
+		automaticContinuation: false,
 	};
 
 	if (options.thinking?.enabled && model.reasoning) {

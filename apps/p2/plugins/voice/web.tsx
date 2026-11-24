@@ -10,19 +10,22 @@ import { BACKGROUND_CONTEXT, contribute, defineFacet, type HeldIn, liveIn } from
 import {
 	CheckIcon,
 	closeLayers,
-	openLayer,
+	pressVerb,
+	SettingsSections,
 	Sheet,
 	Slots,
+	upperFirst,
 	useCanWrite,
 	useComposerState,
 	useObject,
 	useOptimisticCall,
 	useOwner,
+	usePointerKind,
 	useReadable,
 	useRoute,
 	useSheet,
 } from "@p2/app/v1/web";
-import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { Chat } from "../chat/contract.ts";
 import { ChatMode, DEFAULT_AGENT_NAME } from "../chat-mode/contract.ts";
 import { engineLabel, languagesOf, resolved, resolveVoice } from "./choice.ts";
@@ -371,6 +374,7 @@ function VoiceChip() {
  * guest's has the state and its own pause only (the voice is the owner's).
  */
 function VoiceSheet({ config, owner, onClose }: { config: VoiceConfig; owner: boolean; onClose: () => void }) {
+	const pointer = usePointerKind();
 	const { session, conversation = 1 } = useRoute();
 	const input = useMemo(() => (session ? { session, conversation } : undefined), [session, conversation]);
 	const { ownerMode, voice: shared } = useVoiceMode(input);
@@ -545,37 +549,41 @@ function VoiceSheet({ config, owner, onClose }: { config: VoiceConfig; owner: bo
 					</section>
 				))}
 			</div>
-			<p className="muted small">Tap a voice, or choose a language, to hear it.</p>
+			<p className="muted small">{upperFirst(pressVerb(pointer))} a voice, or choose a language, to hear it.</p>
 		</Sheet>
 	);
 }
 
 /**
- * The sidebar footer's entry to the Voice sheet, when the server has a speech service: the owner's whole sheet, a
- * read/write guest's own pause.
+ * The Voice sheet while it is open, when the server has a speech service: the owner's whole sheet, a read/write
+ * guest's own pause.
  */
-function VoiceButton() {
+function VoiceSheetSlot() {
 	const { owner, talker } = useTalker();
 	const config = useVoiceConfig(talker);
 	const sheet = useSheet("voice");
-	if (!talker || !config) return null;
-	return (
-		<>
-			<button
-				type="button"
-				className="foot-button"
-				title={owner ? "Voice mode's voice, speed and pause" : "Voice mode's pause"}
-				onClick={() => openLayer({ kind: "sheet", name: "voice" }, { fromDrawer: true })}
-			>
-				Voice
-			</button>
-			{sheet && <VoiceSheet config={config} owner={owner} onClose={closeLayers} />}
-		</>
-	);
+	return talker && config && sheet ? <VoiceSheet config={config} owner={owner} onClose={closeLayers} /> : null;
+}
+
+/** Settings' Voice section while the server has a speech service. */
+function VoiceShown({ children }: { children: ReactNode }) {
+	const { talker } = useTalker();
+	return useVoiceConfig(talker) ? children : null;
 }
 
 export default defineFacet((host) => {
 	contribute(host, "p2.voice-web", (self) => {
-		self.contribute(Slots, { "composer:voice": VoiceChip, "sidebar-foot:voice": VoiceButton });
+		self.contribute(SettingsSections, {
+			voice: {
+				label: "Voice",
+				title: "Voice mode's voice, speed and pause",
+				order: 70,
+				Sheet: VoiceSheetSlot,
+				Shown: VoiceShown,
+			},
+		});
+		self.contribute(Slots, {
+			"composer:voice": VoiceChip,
+		});
 	});
 });

@@ -13,6 +13,7 @@
 
 ### Fixed
 
+- Fixed selecting the `xhigh` thinking level for Gemini 4 Hydrogen and Neon on the `google` and `google-vertex` providers failing with `Unsupported Google thinking level mapping ... xhigh -> xhigh` ([#12184](https://github.com/earendil-works/pi/issues/12184))
 - Fixed sessions with very many entries after the last compaction (about 120k or more) failing to load with `RangeError: Maximum call stack size exceeded` when building the context ([#12154](https://github.com/earendil-works/pi/issues/12154))
 - Fixed `ctx.ui.pasteToEditor()` and `ctx.ui.setEditorText()` not repainting the editor when called outside terminal input handling, such as after an `await` in a command handler ([#12295](https://github.com/earendil-works/pi/issues/12295))
 - Fixed the bash tool returning `(no output)` when the output ended with a line over 50KB followed by an empty line; it now shows the end of that line ([#12350](https://github.com/earendil-works/pi/issues/12350))
@@ -26,6 +27,7 @@
 - Fixed `/login` showing a provider as configured when its stored `auth.json` key is a `!command` that fails, while requests failed with `No API key found`. `/login` now shows `stored key did not resolve`, `getProviderAuthStatus()` returns `{ configured: false, source: "stored" }`, and entering the same `!command` again in `/login` runs it again instead of reusing the cached failure ([#12164](https://github.com/earendil-works/pi/issues/12164))
 - Fixed `/login` showing a provider as configured when its stored `auth.json` key is a `!command` that fails, while requests failed with `No API key found`; the provider now shows as not configured ([#12164](https://github.com/earendil-works/pi/issues/12164))
 - Fixed `pi update` run from WSL through the Windows installation of pi rebuilding that installation with Linux npm; it now stops and says that running the Windows installation from WSL is unsupported ([#12172](https://github.com/earendil-works/pi/issues/12172))
+- Fixed right-click paste inserting the clipboard twice in Tabby on Windows, which pastes on right-click itself ([#12406](https://github.com/earendil-works/pi/issues/12406))
 
 ## [1.6.0] - 2026-11-20
 

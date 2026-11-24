@@ -41,8 +41,7 @@ async function setup(mode: ExtensionCommandContext["mode"] = "tui") {
 	const complete = vi.fn<ModelRegistry["complete"]>(async () => {
 		throw new Error("Unexpected completion");
 	});
-	let interact: (component: { handleInput?(data: string): void; render(width: number): string[] }) => Promise<void> =
-		async () => {};
+	let interact: (component: Pick<Component, "handleInput" | "render">) => Promise<void> = async () => {};
 	initTheme("dark");
 	const custom = vi.fn<ExtensionUIContext["custom"]>(
 		async <T>(
